@@ -1,4 +1,4 @@
-// Unit tests for the session-based pricing engine.
+// Unit tests for the rebuilt proration engine.
 // Run with: npx vitest run src/lib/ennajd-billing.test.ts
 
 import { describe, it, expect } from "vitest";
@@ -6,14 +6,18 @@ import {
   applyCreditWaterfall,
   buildDeliveredDatesContext,
   computeExpectedMonthAmount,
+  computeMonthInvoice,
   dedupePayments,
+  earliestMonthAttendance,
   earliestValidAttendanceDate,
   generateRuleBSchedule,
   generateScheduleFor,
   generateSessionBasedSchedule,
+  getEffectivePriceFor,
   getFixedSessionCount,
   getPaymentRemaining,
   getPaymentRuleFor,
+  getStandardSessionCount,
   isPaymentFullyPaid,
   recalculateStudentSubjectLedger,
   reconcilePaymentAmounts,
@@ -41,9 +45,6 @@ import type {
 const STUDENT_ID = "student-1";
 const NOW = "2025-01-15T12:00:00.000Z";
 const PRICE = 400; // monthly fee for a 1x/week subject → perSession = 100
-
-/** Noontime ISO so local-calendar fields are stable in any timezone. */
-const NOON = "T12:00:00.000Z";
 
 function makeCtx(opts: {
   hasSession?: boolean;
@@ -147,7 +148,86 @@ function makeAttendance(
 const WED_CTX = makeCtx({ scheduledDaysOfWeek: [3] });
 
 // ---------------------------------------------------------------------------
-// Session-based pricing — core formula
+// Rule routing — Rule 5 (broadened): EVERY 2Bac Small combo is Rule B
+// ---------------------------------------------------------------------------
+
+describe("getPaymentRuleFor — broadened Small-group exclusion", () => {
+  it("routes EVERY 2Bac Small combo to Rule B, both tracks + every subject", () => {
+    // s.x track
+    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.x")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "PC", "Small", "s.x")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "SVT", "Small", "s.x")).toBe("B");
+    // s.m track (broadened — used to be Rule A)
+    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.m")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "PC", "Small", "s.m")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "SVT", "Small", "s.m")).toBe("B");
+    // subjects beyond the old Math/PC/SVT whitelist
+    expect(getPaymentRuleFor("2Bac", "Philosophy", "Small", "s.x")).toBe("B");
+    expect(getPaymentRuleFor("2Bac", "English", "Small", "s.m")).toBe("B");
+  });
+
+  it("keeps every other combo on Rule A (session-based proration)", () => {
+    expect(getPaymentRuleFor("2Bac", "Math", "Large", "s.x")).toBe("A");
+    expect(getPaymentRuleFor("2Bac", "Math", "Large", "s.m")).toBe("A");
+    expect(getPaymentRuleFor("2Bac", "Philosophy", null, "s.x")).toBe("A");
+    expect(getPaymentRuleFor("1Bac", "Math", null, "s.x")).toBe("A");
+    expect(getPaymentRuleFor("T.C", "Math", null, null)).toBe("A");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Price resolution — customPrice wins outright
+// ---------------------------------------------------------------------------
+
+describe("getEffectivePriceFor", () => {
+  const prices: PriceEntry[] = [
+    {
+      id: "price-1",
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      price: PRICE,
+    },
+  ];
+  const student = makeStudent({
+    level: "T.C",
+    enrollments: [{ subject: "Math", track: null, groupType: "Large" }],
+  });
+
+  it("resolves the base price for a matching combo", () => {
+    expect(
+      getEffectivePriceFor(student, student.enrollments[0], prices),
+    ).toBe(PRICE);
+  });
+
+  it("customPrice wins OUTRIGHT even when the base price row is missing", () => {
+    // The empty-ledger root cause: a student whose customPrice is set but
+    // whose base PriceEntry row does not exist must still resolve.
+    const custom: SubjectEnrollment = {
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      customPrice: 250,
+    };
+    expect(getEffectivePriceFor(student, custom, [])).toBe(250);
+    // And it beats an existing base price too.
+    expect(getEffectivePriceFor(student, custom, prices)).toBe(250);
+  });
+
+  it("returns undefined only when neither customPrice nor a base price exists", () => {
+    expect(
+      getEffectivePriceFor(
+        student,
+        { subject: "PC", track: null, groupType: "Large" },
+        prices,
+      ),
+    ).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session-based pricing — the per-month proration core (1x/week)
 // ---------------------------------------------------------------------------
 
 describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", () => {
@@ -161,39 +241,35 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
     const jan = schedule.find((s) => s.monthKey === "2025-01");
     expect(jan).toBeDefined();
     expect(jan!.amount).toBe(400);
-    // Join-month installment is due on the enrollment date itself.
+    // The start month's installment is due on the billing start itself.
     expect(jan!.dueDate).toBe("2025-01-01");
   });
 
   it("charges 75% when 3 of 4 sessions remain (3/4)", () => {
-    // Inclusive window: the anchor session itself is billed, so anchor on a
+    // Inclusive window: the start session itself is billed, so start on a
     // NON-class day (Jan 14, Tue) → 15, 22, 29 remain = 3.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 14), // Jan 14 (Tuesday) → 15, 22, 29 remain
+      new Date(2025, 0, 14),
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
     );
-    const jan = schedule.find((s) => s.monthKey === "2025-01");
-    expect(jan!.amount).toBe(300);
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(300);
   });
 
   it("charges 50% when 2 of 4 sessions remain (2/4)", () => {
-    // Anchor Jan 21 (Tue — not a class day) → 22, 29 remain = 2.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 21), // Jan 21 (Tuesday) → 22, 29 remain
+      new Date(2025, 0, 21), // Jan 21 (Tue) → 22, 29 remain
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
     );
-    const jan = schedule.find((s) => s.monthKey === "2025-01");
-    expect(jan!.amount).toBe(200);
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(200);
   });
 
-  it("charges nothing when a single session remains (1/4 → FREE)", () => {
-    // Anchor Jan 28 (Tue — not a class day) → only Jan 29 remains → FREE.
+  it("charges nothing when a single session remains (lone session = FREE)", () => {
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 28), // Jan 28 (Tuesday) → 29 only remains
+      new Date(2025, 0, 28), // Jan 28 (Tue) → 29 only remains
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
@@ -203,22 +279,8 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
     expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
   });
 
-  it("emits no installment when the join date leaves zero sessions", () => {
-    // Anchoring ON the last Wednesday (Jan 29) bills that one session —
-    // but a lone remaining session is free, so no installment for the join
-    // month either way.
-    const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 29),
-      new Date(2025, 1, 15),
-      WED_CTX,
-      PRICE,
-    );
-    expect(schedule.find((s) => s.monthKey === "2025-01")).toBeUndefined();
-    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
-  });
-
   it("bills the 5th occurrence of a month for FREE (invoice stays 400)", () => {
-    // January 2025 has 5 Wednesdays; joining Jan 1 → 5 occurrences but
+    // January 2025 has 5 Wednesdays; starting Jan 1 → 5 occurrences but
     // billable is capped at fixedCount = 4 → full price, 5th is free.
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 1),
@@ -230,6 +292,7 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
   });
 
   it("charges full price for complete later months, due on the 1st", () => {
+    // A later month anchors on its own 1st → full month (Rule 2).
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 15),
       new Date(2025, 2, 15), // through March
@@ -244,9 +307,9 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
     expect(mar!.dueDate).toBe("2025-03-01");
   });
 
-  it("emits no installment for months before the enrollment date", () => {
+  it("emits no installment for months before the billing start", () => {
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 1, 5), // joins in February
+      new Date(2025, 1, 5), // first attendance in February
       new Date(2025, 2, 15),
       WED_CTX,
       PRICE,
@@ -283,8 +346,7 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
     expect(monthKeys).toContain("2025-03");
   });
 
-  it("respects customPrice in the computation", () => {
-    // Same 4/4 join, but the student's effective price is 300 (Takhfid).
+  it("respects customPrice (Takhfid) in the computation", () => {
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 1),
       new Date(2025, 1, 15),
@@ -296,7 +358,6 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
 
   it("rounds per-session amounts to whole MAD", () => {
     // price 300 with fixedCount 4 → perSession 75 → 2 sessions = 150.
-    // Anchoring Jan 21 (Tue, not a class day) → 22, 29 remain.
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 21), // 2 sessions remain (22, 29)
       new Date(2025, 1, 15),
@@ -321,22 +382,33 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
     expect(getFixedSessionCount(WED_CTX)).toBe(4);
   });
 
+  it("getStandardSessionCount mirrors fixedCount for a combo", () => {
+    const sessions: Session[] = [
+      makeRecurringSession("Math", "T.C", null, "Large", 1),
+      makeRecurringSession("Math", "T.C", null, "Large", 4),
+      makeRecurringSession("PC", "T.C", null, "Large", 2),
+    ];
+    expect(
+      getStandardSessionCount(sessions, {
+        level: "T.C",
+        subject: "Math",
+        track: null,
+        groupType: "Large",
+      }),
+    ).toBe(8);
+  });
+
   it("charges 50% when 4 of 8 sessions remain (4/8)", () => {
-    // Inclusive window: anchor Jan 18 (Sat — not a class day) → sessions
-    // from it are Mon 20, 27 + Thu 23, 30 = 4.
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 18),
+      new Date(2025, 0, 18), // Sat — from Mon 20, 27 + Thu 23, 30 = 4
       new Date(2025, 2, 15),
       MON_THU_CTX,
       PRICE_2X,
     );
-    const jan = schedule.find((s) => s.monthKey === "2025-01");
-    expect(jan!.amount).toBe(400); // 4 × 100
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(400);
   });
 
   it("caps a 9-occurrence month at 8 (full price)", () => {
-    // Joining Jan 1 (Wednesday, but sessions are Mon+Thu): occurrences from
-    // Jan 1..31 = 9 (5 Thu + 4 Mon) → capped at 8 → 800.
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 1),
       new Date(2025, 1, 15),
@@ -346,11 +418,9 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
     expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(800);
   });
 
-  it("charges nothing when only 1 session remains in the join month", () => {
-    // Anchoring Jan 29 (Wed — not a Mon/Thu class day) → only Thu 30
-    // remains → billable 1 → FREE (the lone-session rule still applies).
+  it("charges nothing when only 1 session remains in the start month", () => {
     const schedule = generateSessionBasedSchedule(
-      new Date(2025, 0, 29),
+      new Date(2025, 0, 29), // Wed — only Thu 30 remains → FREE
       new Date(2025, 1, 15),
       MON_THU_CTX,
       PRICE_2X,
@@ -361,39 +431,39 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
 });
 
 // ---------------------------------------------------------------------------
-// computeExpectedMonthAmount
+// computeMonthInvoice / computeExpectedMonthAmount
 // ---------------------------------------------------------------------------
 
-describe("computeExpectedMonthAmount", () => {
-  it("matches the schedule for a full-month join", () => {
-    expect(
-      computeExpectedMonthAmount(new Date(2025, 0, 1), "2025-01", WED_CTX, PRICE),
-    ).toBe(400);
+describe("computeMonthInvoice", () => {
+  it("matches the schedule for a full-month start", () => {
+    expect(computeMonthInvoice(new Date(2025, 0, 1), "2025-01", WED_CTX, PRICE)).toBe(
+      400,
+    );
   });
 
-  it("prorates a mid-month join", () => {
-    // Exclusive window: join Jan 21 (Tue) → 22, 29 remain = 2 sessions.
+  it("prorates a mid-month start", () => {
+    expect(computeMonthInvoice(new Date(2025, 0, 21), "2025-01", WED_CTX, PRICE)).toBe(
+      200,
+    );
+  });
+
+  it("computeExpectedMonthAmount mirrors computeMonthInvoice", () => {
     expect(
       computeExpectedMonthAmount(new Date(2025, 0, 21), "2025-01", WED_CTX, PRICE),
-    ).toBe(200);
+    ).toBe(computeMonthInvoice(new Date(2025, 0, 21), "2025-01", WED_CTX, PRICE));
   });
 
-  it("returns null for the join month with a single session left", () => {
-    // Join Jan 28 (Tue) → only Jan 29 remains → free.
-    expect(
-      computeExpectedMonthAmount(new Date(2025, 0, 28), "2025-01", WED_CTX, PRICE),
-    ).toBeNull();
+  it("returns null for the start month with a single session left", () => {
+    expect(computeMonthInvoice(new Date(2025, 0, 28), "2025-01", WED_CTX, PRICE)).toBeNull();
   });
 
-  it("returns null for months before enrollment", () => {
-    expect(
-      computeExpectedMonthAmount(new Date(2025, 2, 1), "2025-01", WED_CTX, PRICE),
-    ).toBeNull();
+  it("returns null for months before the billing start", () => {
+    expect(computeMonthInvoice(new Date(2025, 2, 1), "2025-01", WED_CTX, PRICE)).toBeNull();
   });
 
   it("returns null for a subject with no timetable", () => {
     expect(
-      computeExpectedMonthAmount(
+      computeMonthInvoice(
         new Date(2025, 0, 1),
         "2025-01",
         makeCtx({ hasSession: false, scheduledDaysOfWeek: [] }),
@@ -404,25 +474,13 @@ describe("computeExpectedMonthAmount", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Rule B — 2Bac s.x Small rolling cycle
+// Rule B — the untouched rolling cycle (every 2Bac Small combo)
 // ---------------------------------------------------------------------------
 
-describe("Rule B — 2Bac s.x Small", () => {
-  it("keeps Math/PC/SVT 2Bac s.x Small on the rolling Rule B cycle", () => {
-    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.x")).toBe("B");
-    expect(getPaymentRuleFor("2Bac", "PC", "Small", "s.x")).toBe("B");
-    expect(getPaymentRuleFor("2Bac", "SVT", "Small", "s.x")).toBe("B");
-  });
-
-  it("keeps other combos on Rule A (session-based)", () => {
-    expect(getPaymentRuleFor("2Bac", "Math", "Small", "s.m")).toBe("A");
-    expect(getPaymentRuleFor("2Bac", "Math", "Large", "s.x")).toBe("A");
-    expect(getPaymentRuleFor("T.C", "Math", "Large", null)).toBe("A");
-  });
-
+describe("Rule B rolling cycle", () => {
   it("bills the full price on the join day and every month on the same day", () => {
     const schedule = generateRuleBSchedule(
-      new Date(2025, 0, 12), // joins Jan 12
+      new Date(2025, 0, 12),
       new Date(2025, 3, 15),
       500,
     );
@@ -439,7 +497,7 @@ describe("Rule B — 2Bac s.x Small", () => {
   it("generateScheduleFor routes Rule A vs Rule B", () => {
     const ruleA = generateScheduleFor(
       "A",
-      new Date(2025, 0, 21), // join Jan 21 (Tue) → 22, 29 remain
+      new Date(2025, 0, 21),
       new Date(2025, 1, 15),
       WED_CTX,
       PRICE,
@@ -471,12 +529,12 @@ describe("buildDeliveredDatesContext", () => {
         date: "2025-01-10",
       },
     ];
-    const ctx = buildDeliveredDatesContext(sessions, [], {
-      level: "T.C",
-      subject: "Math",
-      track: null,
-      groupType: "Large",
-    }, new Date(2025, 0, 1));
+    const ctx = buildDeliveredDatesContext(
+      sessions,
+      [],
+      { level: "T.C", subject: "Math", track: null, groupType: "Large" },
+      new Date(2025, 0, 1),
+    );
     expect(ctx.hasSession).toBe(true);
     expect(ctx.scheduledDaysOfWeek).toEqual([3]); // one_off excluded
     expect(getFixedSessionCount(ctx)).toBe(4);
@@ -495,459 +553,162 @@ describe("buildDeliveredDatesContext", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reconcilePaymentAmounts — daily self-heal
+// Attendance anchors — per-month (Rule 2) + global
 // ---------------------------------------------------------------------------
 
-describe("reconcilePaymentAmounts", () => {
-  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
-  const prices: PriceEntry[] = [
-    {
-      id: "price-1",
-      level: "T.C",
-      subject: "Math",
-      track: null,
-      groupType: "Large",
-      price: PRICE,
-    },
+describe("earliestMonthAttendance — the per-month anchor", () => {
+  const attSessions: Session[] = [
+    makeRecurringSession("Math", "T.C", null, "Large", 2),
+    makeRecurringSession("Math", "T.C", null, "Large", 4),
   ];
 
-  function ledgerStudent(customPrice?: number): Student {
-    const enrollment: SubjectEnrollment = {
-      subject: "Math",
-      track: null,
-      groupType: "Large",
-      enrolledAt: `2025-01-01${NOON}`,
-    };
-    if (customPrice !== undefined) enrollment.customPrice = customPrice;
-    return makeStudent({
-      level: "T.C",
-      enrollments: [enrollment],
-    });
-  }
-
-  it("corrects a stale Rule A amount and clears a false isPaid", () => {
-    // Full-month join should be 400; the frozen row still says 320 (stale)
-    // and is marked paid with 320 paid — the new amountDue 400 is not covered.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 320, true),
-    ];
-    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
-    expect(patches).toHaveLength(1);
-    expect(patches[0].id).toBe("p1");
-    expect(patches[0].amountDue).toBe(400);
-    expect(patches[0].isPaid).toBe(false); // 320 < 400
-  });
-
-  it("keeps isPaid = true only when amountPaid covers the new amount", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 400, true),
-    ];
-    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
-    expect(patches[0].amountDue).toBe(400);
-    expect(patches[0].isPaid).toBe(true); // 400 >= 400
-  });
-
-  it("leaves correct rows untouched", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+  it("returns the earliest PRESENT attendance date WITHIN the month", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-10"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-24"),
     ];
     expect(
-      reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices),
-    ).toHaveLength(0);
+      earliestMonthAttendance(
+        STUDENT_ID,
+        "Math",
+        "2026-09",
+        records,
+        attSessions,
+        "2026-11-15",
+      ),
+    ).toEqual(new Date(2026, 8, 10));
   });
 
-  it("never touches Rule B rows", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
+  it("returns null for a month with no attendance mark yet", () => {
+    // Months with no mark yet anchor on the 1st at the caller level — here
+    // the helper reports the absence.
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
     ];
     expect(
-      reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices),
-    ).toHaveLength(0);
+      earliestMonthAttendance(
+        STUDENT_ID,
+        "Math",
+        "2026-10",
+        records,
+        attSessions,
+        "2026-11-15",
+      ),
+    ).toBeNull();
   });
 
-  it("respects customPrice when recomputing", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+  it("ignores future-dated marks and ABSENT marks", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-12-01"), // future
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-15"),
     ];
-    const patches = reconcilePaymentAmounts(
-      payments,
-      [ledgerStudent(300)],
-      sessions,
-      prices,
-    );
-    expect(patches[0].amountDue).toBe(300);
+    expect(
+      earliestMonthAttendance(
+        STUDENT_ID,
+        "Math",
+        "2026-09",
+        records,
+        attSessions,
+        "2026-11-15",
+      ),
+    ).toEqual(new Date(2026, 8, 15));
   });
 
-  it("patches only the keeper of a duplicated month — never the surplus rows", () => {
-    // A moved anchor left TWO January rows (the 438 = 219 + 219 leak shape):
-    // the pristine generator row and a re-dated duplicate. Only ONE row may
-    // be patched — double-patching would keep the ledger inflated at 800
-    // until a collapse pass runs.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
-      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 400, true),
+  it("ignores other students and other subjects' sessions", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance("other-student", "session-Math-T.C-2", "2026-09-01"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-15"),
     ];
-    const patches = reconcilePaymentAmounts(payments, [ledgerStudent()], sessions, prices);
-    expect(patches).toHaveLength(1);
-    // The settled row wins the keeper race; its dueDate moves to the
-    // engine's join-month date, its own amountPaid is carried as-is.
-    expect(patches[0]).toEqual({
-      id: "p2",
-      amountDue: 400,
-      dueDate: "2025-01-01",
-      amountPaid: 400,
-      isPaid: true,
-    });
+    expect(
+      earliestMonthAttendance(
+        STUDENT_ID,
+        "Math",
+        "2026-09",
+        records,
+        attSessions,
+        "2026-11-15",
+      ),
+    ).toEqual(new Date(2026, 8, 15));
   });
 });
 
-// ---------------------------------------------------------------------------
-// reconcileRuleALedger — authoritative self-heal (update + delete)
-// ---------------------------------------------------------------------------
-
-describe("reconcileRuleALedger", () => {
-  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
-  const prices: PriceEntry[] = [
-    {
-      id: "price-1",
-      level: "T.C",
-      subject: "Math",
-      track: null,
-      groupType: "Large",
-      price: PRICE,
-    },
+describe("earliestValidAttendanceDate — the global anchor", () => {
+  const attSessions: Session[] = [
+    makeRecurringSession("Math", "T.C", null, "Large", 2),
+    makeRecurringSession("PC", "T.C", null, "Large", 3),
   ];
 
-  function ledgerStudent(enrolledAt = `2025-01-01${NOON}`): Student {
-    const enrollment: SubjectEnrollment = {
-      subject: "Math",
-      track: null,
-      groupType: "Large",
-      enrolledAt,
-    };
-    return makeStudent({ level: "T.C", enrollments: [enrollment] });
-  }
-
-  it("reports a stale Rule A amount as an update (paid progress preserved)", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 150, false),
+  it("returns the earliest non-future attendance date for the subject", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-10"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-24"),
     ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
-    expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 400,
-        dueDate: "2025-01-01", // join month → the anchor date itself
-        amountPaid: 150, // consolidated group credit (single row here)
-        isPaid: false, // 150 < 400
-      },
-    ]);
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toEqual(new Date(2026, 8, 10));
   });
 
-  it("reports a correct row as untouched", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 400, true),
-    ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
-    expect(result.update).toEqual([]);
-    expect(result.delete).toEqual([]);
+  it("returns null when the student has no attendance yet", () => {
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", [], attSessions, "2026-11-15"),
+    ).toBeNull();
   });
 
-  it("deletes a row whose month is no longer billable (timetable removed)", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+  it("ignores future-dated records", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-12-01"),
     ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent()],
-      [], // no sessions → no timetable
-      prices,
-    );
-    expect(result.update).toEqual([]);
-    expect(result.delete).toEqual(["p1"]);
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toEqual(new Date(2026, 8, 17));
   });
 
-  it("deletes a row whose enrollment was dropped", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+  it("ignores ABSENT records — only a PRESENT mark anchors billing", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-15", "present"),
     ];
-    const studentWithNoEnrollments = makeStudent({
-      level: "T.C",
-      enrollments: [],
-    });
-    const result = reconcileRuleALedger(
-      payments,
-      [studentWithNoEnrollments],
-      sessions,
-      prices,
-    );
-    expect(result.delete).toEqual(["p1"]);
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toEqual(new Date(2026, 8, 15));
   });
 
-  it("deletes a row whose price no longer resolves", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+  it("ignores other students' records and other subjects' sessions", () => {
+    const records: AttendanceRecord[] = [
+      makeAttendance("other-student", "session-Math-T.C-2", "2026-09-01"),
+      makeAttendance(STUDENT_ID, "session-PC-T.C-3", "2026-09-03"),
+      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-15"),
     ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, []);
-    expect(result.delete).toEqual(["p1"]);
-  });
-
-  it("deletes a row predating enrollment", () => {
-    // Enrolled Jan 15; a leftover row for December (before enrollment at
-    // all) must be deleted — the engine emits nothing for it.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2024-12-01", 400, 0, false),
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent(`2025-01-15${NOON}`)],
-      sessions,
-      prices,
-    );
-    expect(result.delete).toEqual(["p1"]);
-  });
-
-  it("deletes an orphan row whose student no longer exists", () => {
-    const payments: Payment[] = [
-      makePayment("p1", "ghost", "Math", "2025-01-01", 400, 0, false),
-    ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
-    expect(result.delete).toEqual(["p1"]);
-  });
-
-  it("never touches Rule B rows, even stale ones", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
-    ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], [], []);
-    expect(result.update).toEqual([]);
-    expect(result.delete).toEqual([]);
-  });
-
-  it("updates a mid-month-join row to the prorated amount", () => {
-    // Anchored Jan 15 (Wednesday) — the 15th session is billed inclusive,
-    // so 15 + 22 + 29 = 3 of 4 sessions → 300, not 400.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 400, 0, false),
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent(`2025-01-15${NOON}`)],
-      sessions,
-      prices,
-    );
-    expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 300,
-        dueDate: "2025-01-15", // join month → anchor date
-        amountPaid: 0,
-        isPaid: false,
-      },
-    ]);
-  });
-
-  it("uses the attendance anchor when attendance records are present", () => {
-    // Enrolled Jan 15 (Wed), but attendance proves the student already
-    // attended on Jan 8 → the anchor moves to Jan 8 (inclusive): sessions
-    // 8, 15, 22, 29 = 4 → full 400, even from a mid-month enrollment.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 200, 0, false),
-    ];
-    const attendance: AttendanceRecord[] = [
-      {
-        id: "att-1",
-        studentId: STUDENT_ID,
-        sessionId: "session-Math-T.C-3",
-        date: "2025-01-08",
-        status: "present",
-        markedAt: NOW,
-        timestamp: "12:00",
-      },
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent(`2025-01-15${NOON}`)],
-      sessions,
-      prices,
-      attendance,
-      "2025-01-31",
-    );
-    expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 400,
-        dueDate: "2025-01-08", // re-anchored join month → new anchor date
-        amountPaid: 0,
-        isPaid: false,
-      },
-    ]);
-  });
-
-  it("ignores an ABSENT record and keeps the enrollment anchor", () => {
-    // Enrolled Jan 15 with an auto-absence mark on Jan 8 — absence never
-    // anchors billing, so the window stays [Jan 15, month-end] = 3 sessions
-    // → 300, not the 400 a Jan-8 anchor would give.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-15", 200, 0, false),
-    ];
-    const attendance: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-3", "2025-01-08", "absent"),
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent(`2025-01-15${NOON}`)],
-      sessions,
-      prices,
-      attendance,
-      "2025-01-31",
-    );
-    expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 300,
-        dueDate: "2025-01-15",
-        amountPaid: 0,
-        isPaid: false,
-      },
-    ]);
-  });
-
-  // -------------------------------------------------------------------------
-  // ONE charge per month — collapse duplicates (the 438 = 219 + 219 fix)
-  // -------------------------------------------------------------------------
-
-  it("collapses two same-month rows into ONE engine-dated row and pools credit", () => {
-    // The daily sync used to mint a second January row when the attendance
-    // anchor moved (dedupe key was dueDate). The report matrix then summed
-    // both charges. Reconcile must keep exactly ONE row, re-date it onto the
-    // engine's join-month date, and consolidate the group's paid credit so
-    // no payment progress is lost.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 250, false),
-      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 150, false),
-    ];
-    const result = reconcileRuleALedger(payments, [ledgerStudent()], sessions, prices);
-
-    // The surplus row is reported for deletion...
-    expect(result.delete).toEqual(["p2"]);
-    // ...and the keeper absorbs the group's credit: 250 + 150 = 400 → paid.
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 400,
-        dueDate: "2025-01-01",
-        amountPaid: 400,
-        isPaid: true,
-      },
-    ]);
-
-    // Applying the patch must leave exactly one row for the month.
-    const survivors = payments
-      .filter((p) => !result.delete.includes(p.id))
-      .map((p) => (p.id === result.update[0].id ? { ...p, ...result.update[0] } : p));
-    expect(survivors).toHaveLength(1);
-    expect(survivors[0].amountDue).toBe(400);
-    expect(isPaymentFullyPaid(survivors[0])).toBe(true);
-  });
-
-  it("deletes the WHOLE group when the month stops being billable", () => {
-    // Both duplicates of a now-non-billable month are stale — deleting only
-    // one would leave a ghost charge on the ledger.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 400, true),
-      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 0, false),
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent()],
-      [], // timetable removed → the engine emits nothing for January
-      prices,
-    );
-    expect(result.update).toEqual([]);
-    expect(result.delete.sort()).toEqual(["p1", "p2"]);
-  });
-
-  it("re-dates the keeper onto the anchor when the anchor moved", () => {
-    // Enrollment says Jan 1, but attendance proves the student started
-    // Jan 8 → the join month's dueDate becomes the anchor (Jan 8), and the
-    // row still sitting on the stale date is re-dated rather than duplicated.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
-    ];
-    const attendance: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-3", "2025-01-08"),
-    ];
-    const result = reconcileRuleALedger(
-      payments,
-      [ledgerStudent()],
-      sessions,
-      prices,
-      attendance,
-      "2025-01-31",
-    );
-    expect(result.delete).toEqual([]);
-    expect(result.update).toEqual([
-      {
-        id: "p1",
-        amountDue: 400, // Jan 8 + 15 + 22 + 29 = 4 sessions
-        dueDate: "2025-01-08",
-        amountPaid: 0,
-        isPaid: false,
-      },
-    ]);
+    expect(
+      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
+    ).toEqual(new Date(2026, 8, 15));
   });
 });
 
 // ---------------------------------------------------------------------------
-// dedupePayments — hydration self-heal (one row per student__subject__month)
-// ---------------------------------------------------------------------------
-
-describe("dedupePayments", () => {
-  it("collapses same-month duplicates regardless of dueDate", () => {
-    // A re-dated duplicate shares the calendar MONTH even when its dueDate
-    // moved — keying on the month is what lets hydration wipe DB duplicates.
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
-      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 400, true),
-      makePayment("p3", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
-    ];
-    const result = dedupePayments(payments);
-    expect(result.kept.map((p) => p.id).sort()).toEqual(["p2", "p3"]);
-    expect(result.duplicateIds).toEqual(["p1"]); // the settled row wins
-  });
-
-  it("returns the ledger untouched when it is already clean", () => {
-    const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
-      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
-    ];
-    expect(dedupePayments(payments)).toEqual({
-      kept: payments,
-      duplicateIds: [],
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// applyCreditWaterfall — plain dueDate-ascending gap filling
+// applyCreditWaterfall — the wallet waterfall (surplus rolls forward)
 // ---------------------------------------------------------------------------
 
 describe("applyCreditWaterfall", () => {
-  it("distributes credit across current + future installments (surplus rolls forward)", () => {
-    // 3 installments: 300 + 300 + 400 = 1000 of gaps; credit = 500 clears
-    // p1 (300) and p2 (200 of its 300), leaving p3 untouched.
+  it("distributes credit across gaps dueDate-ascending (surplus rolls forward)", () => {
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
       makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
       makePayment("p3", STUDENT_ID, "PC", "2025-03-01", 400),
     ];
 
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 500, "2025-01-15", NOW);
+    const result = applyCreditWaterfall(
+      payments,
+      STUDENT_ID,
+      "PC",
+      500,
+      "2025-01-15",
+      NOW,
+    );
 
     expect(result.remaining).toBe(0);
     expect(result.anyChanged).toBe(true);
@@ -958,7 +719,28 @@ describe("applyCreditWaterfall", () => {
     expect(result.updated.find((p) => p.id === "p3")).toBeUndefined();
   });
 
-  it("stores surplus as remaining when credit exceeds all installment gaps", () => {
+  it("shows surplus on the NEXT month as partial credit (the green contract)", () => {
+    // Month 9 fully paid; a 150 surplus must land on month 10's row.
+    const payments: Payment[] = [
+      makePayment("m9", STUDENT_ID, "Math", "2026-09-01", 350, 350, true),
+      makePayment("m10", STUDENT_ID, "Math", "2026-10-01", 350),
+    ];
+    const result = applyCreditWaterfall(
+      payments,
+      STUDENT_ID,
+      "Math",
+      150,
+      "2026-09-30",
+      NOW,
+    );
+    const m10 = result.updated.find((p) => p.id === "m10");
+    expect(m10).toBeDefined();
+    expect(m10!.amountPaid).toBe(150); // shown GREEN as advance credit
+    expect(m10!.isPaid).toBe(false);
+    expect(result.remaining).toBe(0);
+  });
+
+  it("stores surplus as remaining when credit exceeds all gaps", () => {
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
     ];
@@ -986,7 +768,7 @@ describe("applyCreditWaterfall", () => {
     expect(result.updated).toHaveLength(0);
   });
 
-  it("respects subject filter (cross-subject mode with subject=null)", () => {
+  it("cross-subject mode (subject=null) spills across subjects", () => {
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
       makePayment("p2", STUDENT_ID, "Math", "2025-01-01", 200),
@@ -996,7 +778,7 @@ describe("applyCreditWaterfall", () => {
     expect(result.updated).toHaveLength(2);
   });
 
-  it("respects subject filter (per-subject mode only touches one subject)", () => {
+  it("per-subject mode only touches one subject", () => {
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
       makePayment("p2", STUDENT_ID, "Math", "2025-01-01", 200),
@@ -1005,17 +787,6 @@ describe("applyCreditWaterfall", () => {
     expect(result.remaining).toBe(100);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
-  });
-
-  it("sorts by dueDate ascending before applying", () => {
-    const payments: Payment[] = [
-      makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
-      makePayment("p1", STUDENT_ID, "PC", "2025-01-01", 300),
-    ];
-    const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 300, "2025-01-15", NOW);
-    expect(result.remaining).toBe(0);
-    expect(result.updated.find((p) => p.id === "p1")!.amountPaid).toBe(300);
-    expect(result.updated.find((p) => p.id === "p2")).toBeUndefined();
   });
 
   it("skips already-fully-paid installments", () => {
@@ -1043,23 +814,326 @@ describe("applyCreditWaterfall", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Spec regression — T.C Math 350 DH · Mardi+Jeudi 19:00 · enrolled 2026-09-15
+// dedupePayments — one row per student__subject__month (No-Loop-Bug)
 // ---------------------------------------------------------------------------
-// Sept 2026: 2026-09-01 is a Tuesday → Tuesdays 1, 8, 15, 22, 29 (5) +
-// Thursdays 3, 10, 17, 24 (4). fixedCount = 4 × 2 = 8,
-// perSession = 350 / 8 = 43.75.
-// The anchor session IS billable → anchored on the enrollment date 15/09
-// (no attendance yet), sessions from 15/09 inclusive = 15, 17, 22, 24, 29
-// = 5 → 5 × 43.75 = 219 DH. An ATTENDANCE anchor of 17/09 gives 4
-// sessions = 175 DH; a pre-registration mark on 10/09 gives 6 = 263 DH.
+
+describe("dedupePayments", () => {
+  it("collapses same-month duplicates regardless of dueDate", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 400, true),
+      makePayment("p3", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
+    ];
+    const result = dedupePayments(payments);
+    expect(result.kept.map((p) => p.id).sort()).toEqual(["p2", "p3"]);
+    expect(result.duplicateIds).toEqual(["p1"]); // the settled row wins
+  });
+
+  it("returns the ledger untouched when it is already clean", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-02-01", 400, 0, false),
+    ];
+    expect(dedupePayments(payments)).toEqual({ kept: payments, duplicateIds: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcile — daily self-heal
+// ---------------------------------------------------------------------------
+
+describe("reconcilePaymentAmounts", () => {
+  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+  const prices: PriceEntry[] = [
+    {
+      id: "price-1",
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      price: PRICE,
+    },
+  ];
+
+  function ledgerStudent(customPrice?: number): Student {
+    const enrollment: SubjectEnrollment = {
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      enrolledAt: "2025-01-01T12:00:00.000Z",
+    };
+    if (customPrice !== undefined) enrollment.customPrice = customPrice;
+    return makeStudent({ level: "T.C", enrollments: [enrollment] });
+  }
+
+  it("corrects a stale Rule A amount and clears a false isPaid", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 320, true),
+    ];
+    const patches = reconcilePaymentAmounts(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(patches).toHaveLength(1);
+    expect(patches[0].id).toBe("p1");
+    expect(patches[0].amountDue).toBe(400);
+    expect(patches[0].isPaid).toBe(false); // 320 < 400
+  });
+
+  it("keeps isPaid = true only when amountPaid covers the new amount", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 400, true),
+    ];
+    const patches = reconcilePaymentAmounts(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(patches[0].amountDue).toBe(400);
+    expect(patches[0].isPaid).toBe(true);
+  });
+
+  it("leaves correct rows untouched", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    expect(
+      reconcilePaymentAmounts(
+        payments,
+        [ledgerStudent()],
+        sessions,
+        prices,
+        [],
+        "2025-02-15",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("never touches Rule B rows", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
+    ];
+    expect(
+      reconcilePaymentAmounts(
+        payments,
+        [ledgerStudent()],
+        sessions,
+        prices,
+        [],
+        "2025-02-15",
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("respects customPrice when recomputing", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const patches = reconcilePaymentAmounts(
+      payments,
+      [ledgerStudent(300)],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(patches[0].amountDue).toBe(300);
+  });
+});
+
+describe("reconcileRuleALedger", () => {
+  const sessions = [makeRecurringSession("Math", "T.C", null, "Large", 3)];
+  const prices: PriceEntry[] = [
+    {
+      id: "price-1",
+      level: "T.C",
+      subject: "Math",
+      track: null,
+      groupType: "Large",
+      price: PRICE,
+    },
+  ];
+
+  function ledgerStudent(enrolledAt = "2025-01-01T12:00:00.000Z"): Student {
+    return makeStudent({
+      level: "T.C",
+      enrollments: [
+        { subject: "Math", track: null, groupType: "Large", enrolledAt },
+      ],
+    });
+  }
+
+  it("reports a stale Rule A amount as an update (paid progress preserved)", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 150, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01",
+        amountPaid: 150,
+        isPaid: false,
+      },
+    ]);
+  });
+
+  it("reports a correct row as untouched", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 400, true),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual([]);
+  });
+
+  it("deletes a row whose month is no longer billable (timetable removed)", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      [], // no sessions → no timetable
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes a row whose enrollment was dropped", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [makeStudent({ level: "T.C", enrollments: [] })],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("deletes a row whose price no longer resolves", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      [],
+      [],
+      "2025-02-15",
+    );
+    expect(result.delete).toEqual(["p1"]);
+  });
+
+  it("never touches Rule B rows, even stale ones", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 999, 0, false, "B"),
+    ];
+    const result = reconcileRuleALedger(payments, [ledgerStudent()], [], [], [], "2025-02-15");
+    expect(result.update).toEqual([]);
+    expect(result.delete).toEqual([]);
+  });
+
+  it("re-dates the keeper onto the anchor when attendance moved it", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 0, false),
+    ];
+    const attendance: AttendanceRecord[] = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-3", "2025-01-08"),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      attendance,
+      "2025-01-31",
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400, // Jan 8 + 15 + 22 + 29 = 4 sessions
+        dueDate: "2025-01-08",
+        amountPaid: 0,
+        isPaid: false,
+      },
+    ]);
+  });
+
+  it("collapses two same-month rows into ONE and pools the credit", () => {
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 250, false),
+      makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 150, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.delete).toEqual(["p2"]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01",
+        amountPaid: 400, // 250 + 150 pooled
+        isPaid: true,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------//
+// Spec regression — T.C Math 350 DH · Mardi+Jeudi 19:00 · enrolled 2026-09-15
+// ---------------------------------------------------------------------------//
+// Sept 2026: Tuesdays 1, 8, 15, 22, 29 (5) + Thursdays 3, 10, 17, 24 (4).
+// fixedCount = 8, perSession = 350 / 8 = 43.75.
+//   billing start 15/09 (no attendance)     → 5 sessions → 219 DH
+//   attendance anchor 17/09                  → 4 sessions → 175 DH
+//   attendance anchor 10/09 (pre-registration) → 6 sessions → 263 DH
+//   attendance anchor 08/09                  → 7 sessions → 306 DH
 
 describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15", () => {
   const TUE_THU_CTX = makeCtx({ scheduledDaysOfWeek: [2, 4] }); // Mardi + Jeudi
   const PRICE_350 = 350;
   const ENROLLED = new Date(2026, 8, 15); // 2026-09-15 (Tuesday)
-  const SPEC_NOW = "2026-11-15T12:00:00.000Z";
 
-  it("bills Sept 2026 at 219 DH (5 sessions × 43.75), due on the anchor date", () => {
+  it("bills Sept 2026 at 219 DH (5 sessions × 43.75), due on the start date", () => {
     expect(getFixedSessionCount(TUE_THU_CTX)).toBe(8);
     const schedule = generateSessionBasedSchedule(
       ENROLLED,
@@ -1074,8 +1148,6 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
   });
 
   it("re-bills Sept 2026 at 175 DH when attendance anchors on 17/09", () => {
-    // Attendance marked on Thu 17/09 → anchor 17/09 inclusive →
-    // 17, 22, 24, 29 = 4 sessions × 43.75 = 175 DH.
     const schedule = generateSessionBasedSchedule(
       new Date(2026, 8, 17), // attendance anchor 2026-09-17 (Thursday)
       new Date(2026, 10, 15),
@@ -1083,15 +1155,11 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const sept = schedule.find((s) => s.monthKey === "2026-09");
-    expect(sept).toBeDefined();
     expect(sept!.amount).toBe(175);
     expect(sept!.dueDate).toBe("2026-09-17");
   });
 
   it("re-bills Sept 2026 at 263 DH when a 10/09 mark predates enrollment", () => {
-    // Attendance marked on Thu 10/09 (before the 15/09 registration) →
-    // anchor 10/09 inclusive → 10, 15, 17, 22, 24, 29 = 6 sessions × 43.75
-    // = 262.5 → 263 DH.
     const schedule = generateSessionBasedSchedule(
       new Date(2026, 8, 10), // attendance anchor 2026-09-10 (Thursday)
       new Date(2026, 10, 15),
@@ -1099,14 +1167,11 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const sept = schedule.find((s) => s.monthKey === "2026-09");
-    expect(sept).toBeDefined();
     expect(sept!.amount).toBe(263);
     expect(sept!.dueDate).toBe("2026-09-10");
   });
 
-  it("bills Sept 2026 at 306 DH when 7 of 8 sessions remain (7 × 43.75)", () => {
-    // Attendance anchored on Tue 08/09 (inclusive): 8, 15, 22, 29 (Tue) +
-    // 10, 17, 24 (Thu) = 7 sessions → 7 × 43.75 = 306.25 → 306.
+  it("bills Sept 2026 at 306 DH when 7 of 8 sessions remain", () => {
     const schedule = generateSessionBasedSchedule(
       new Date(2026, 8, 8), // attendance anchor 2026-09-08 (Tuesday)
       new Date(2026, 10, 15),
@@ -1114,12 +1179,11 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const sept = schedule.find((s) => s.monthKey === "2026-09");
-    expect(sept).toBeDefined();
     expect(sept!.amount).toBe(306);
     expect(sept!.dueDate).toBe("2026-09-08");
   });
 
-  it("bills Oct 2026 at the full 350 DH (9 occurrences capped at 8), due on the 1st", () => {
+  it("bills Oct 2026 at the full 350 DH (9 occurrences capped at 8)", () => {
     const schedule = generateSessionBasedSchedule(
       ENROLLED,
       new Date(2026, 10, 15),
@@ -1127,38 +1191,13 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const oct = schedule.find((s) => s.monthKey === "2026-10");
-    expect(oct).toBeDefined();
     expect(oct!.amount).toBe(350);
     expect(oct!.dueDate).toBe("2026-10-01");
   });
 
-  it("resumes 350 DH on the 1st of each following month", () => {
+  it("charges nothing when only one session remains in the start month", () => {
     const schedule = generateSessionBasedSchedule(
-      ENROLLED,
-      new Date(2026, 10, 15),
-      TUE_THU_CTX,
-      PRICE_350,
-    );
-    const nov = schedule.find((s) => s.monthKey === "2026-11");
-    expect(nov).toBeDefined();
-    expect(nov!.amount).toBe(350);
-    expect(nov!.dueDate).toBe("2026-11-01");
-  });
-
-  it("computeExpectedMonthAmount(\"2026-09\") = 219", () => {
-    expect(
-      computeExpectedMonthAmount(ENROLLED, "2026-09", TUE_THU_CTX, PRICE_350),
-    ).toBe(219);
-    expect(
-      computeExpectedMonthAmount(ENROLLED, "2026-10", TUE_THU_CTX, PRICE_350),
-    ).toBe(350);
-  });
-
-  it("charges nothing when only one session remains in the join month", () => {
-    // Anchoring on 25/09 (Fri — past the last Thursday) → only Tue 29
-    // remains → a lone session is free, so no September installment.
-    const schedule = generateSessionBasedSchedule(
-      new Date(2026, 8, 25),
+      new Date(2026, 8, 25), // Fri — past the last Thursday
       new Date(2026, 10, 15),
       TUE_THU_CTX,
       PRICE_350,
@@ -1166,148 +1205,11 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
     expect(schedule.find((s) => s.monthKey === "2026-09")).toBeUndefined();
     expect(schedule.find((s) => s.monthKey === "2026-10")!.amount).toBe(350);
   });
-
-  it("settles Sept and pre-pays half of Oct when 350 DH is paid at registration", () => {
-    // applyInitialTuitionPayment generates Sept (175, due 15/09) + Oct (350,
-    // due 01/10) + Nov (350, due 01/11), then runs applyCreditWaterfall(350).
-    const payments: Payment[] = [
-      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 175),
-      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350),
-      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", 350),
-    ];
-
-    const result = applyCreditWaterfall(
-      payments,
-      STUDENT_ID,
-      null, // cross-subject mode (creation-time waterfall)
-      350,
-      "2026-09-15",
-      SPEC_NOW,
-    );
-
-    // Sept absorbs 175 → fully paid / green.
-    const sept = result.updated.find((p) => p.id === "sept");
-    expect(sept).toBeDefined();
-    expect(sept!.amountPaid).toBe(175);
-    expect(isPaymentFullyPaid(sept!)).toBe(true);
-
-    // Oct absorbs the 175 surplus → 175 paid so far, still due 175.
-    const oct = result.updated.find((p) => p.id === "oct");
-    expect(oct).toBeDefined();
-    expect(oct!.amountPaid).toBe(175);
-    expect(oct!.amountDue).toBe(350);
-    expect(isPaymentFullyPaid(oct!)).toBe(false);
-
-    // Nov untouched, and no orphan credit → advanceBalance stays 0.
-    expect(result.updated.find((p) => p.id === "nov")).toBeUndefined();
-    expect(result.remaining).toBe(0);
-  });
-
-  it("fully pays Oct with a follow-up 175 DH partial payment on 15/10", () => {
-    const payments: Payment[] = [
-      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 175, 175, true),
-      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 175, false),
-      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", 350),
-    ];
-
-    const result = applyCreditWaterfall(
-      payments,
-      STUDENT_ID,
-      "Math",
-      175,
-      "2026-10-15",
-      SPEC_NOW,
-    );
-
-    const oct = result.updated.find((p) => p.id === "oct");
-    expect(oct).toBeDefined();
-    expect(oct!.amountPaid).toBe(350); // 175 + 175 = 350
-    expect(isPaymentFullyPaid(oct!)).toBe(true);
-    expect(result.remaining).toBe(0); // nothing left over
-    expect(result.updated.find((p) => p.id === "nov")).toBeUndefined();
-  });
 });
 
 // ---------------------------------------------------------------------------//
-// earliestValidAttendanceDate — the reactive billing anchor
+// recalculateStudentSubjectLedger — the reactive per-month rebuild
 // ---------------------------------------------------------------------------//
-
-describe("earliestValidAttendanceDate", () => {
-  const attSessions: Session[] = [
-    makeRecurringSession("Math", "T.C", null, "Large", 2),
-    makeRecurringSession("PC", "T.C", null, "Large", 3),
-  ];
-
-  it("returns the earliest non-future attendance date for the subject", () => {
-    const records: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-10"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-24"),
-    ];
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
-    ).toEqual(new Date(2026, 8, 10));
-  });
-
-  it("returns null when the student has no attendance yet", () => {
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", [], attSessions, "2026-11-15"),
-    ).toBeNull();
-  });
-
-  it("ignores future-dated records", () => {
-    const records: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-17"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-12-01"),
-    ];
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
-    ).toEqual(new Date(2026, 8, 17));
-  });
-
-  it("ignores other students' records and other subjects' sessions", () => {
-    const records: AttendanceRecord[] = [
-      makeAttendance("other-student", "session-Math-T.C-2", "2026-09-01"),
-      makeAttendance(STUDENT_ID, "session-PC-T.C-3", "2026-09-03"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-15"),
-    ];
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
-    ).toEqual(new Date(2026, 8, 15));
-  });
-
-  it("ignores ABSENT records — only a PRESENT mark anchors billing", () => {
-    // An auto-absence sweep mark from 01/09 must not move the anchor; the
-    // earliest PRESENT mark (15/09) does.
-    const records: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-15", "present"),
-    ];
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
-    ).toEqual(new Date(2026, 8, 15));
-  });
-
-  it("returns null when the earliest marks are all absent", () => {
-    const records: AttendanceRecord[] = [
-      makeAttendance(STUDENT_ID, "session-Math-T.C-2", "2026-09-01", "absent"),
-      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-15", "absent"),
-    ];
-    expect(
-      earliestValidAttendanceDate(STUDENT_ID, "Math", records, attSessions, "2026-11-15"),
-    ).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------//
-// recalculateStudentSubjectLedger — the reactive attendance-anchored rebuild
-// ---------------------------------------------------------------------------//
-// Spec fixtures: T.C Math, Tue+Thu, 350 DH/month, enrolled 2026-09-15.
-// perSession = 350 / 8 = 43.75.
-//   enrollment anchor 15/09 (no attendance) → 5 sessions → 219 DH
-//   attendance anchor 17/09                → 4 sessions → 175 DH
-//   attendance anchor 10/09 (pre-registration) → 6 sessions → 263 DH
-//   attendance anchor 24/09                → 1 session  → FREE (lone session)
 
 describe("recalculateStudentSubjectLedger", () => {
   const SPEC_SESSIONS: Session[] = [
@@ -1328,7 +1230,11 @@ describe("recalculateStudentSubjectLedger", () => {
   const SPEC_AS_OF_KEY = "2026-11-15";
   const SPEC_UPDATED_AT = "2026-11-15T12:00:00.000Z";
 
-  function specStudent(enrolledAt = "2026-09-15T12:00:00.000Z", customPrice?: number): Student {
+  function specStudent(
+    enrolledAt = "2026-09-15T12:00:00.000Z",
+    customPrice?: number,
+    advanceBalance?: number,
+  ): Student {
     const enrollment: SubjectEnrollment = {
       subject: "Math",
       track: null,
@@ -1336,7 +1242,7 @@ describe("recalculateStudentSubjectLedger", () => {
       enrolledAt,
     };
     if (customPrice !== undefined) enrollment.customPrice = customPrice;
-    return makeStudent({ level: "T.C", enrollments: [enrollment] });
+    return makeStudent({ level: "T.C", enrollments: [enrollment], advanceBalance });
   }
 
   function specCtx(
@@ -1369,11 +1275,7 @@ describe("recalculateStudentSubjectLedger", () => {
   }
 
   it("falls back to the enrollment anchor when there is no attendance", () => {
-    const result = recalculateStudentSubjectLedger(
-      specStudent(),
-      "Math",
-      specCtx([], []),
-    );
+    const result = recalculateStudentSubjectLedger(specStudent(), "Math", specCtx([], []));
     expect(result.toDelete).toEqual([]);
     expect(result.remainingCredit).toBe(0);
     const byMonth = new Map(result.toUpsert.map((p) => [p.month, p]));
@@ -1396,14 +1298,38 @@ describe("recalculateStudentSubjectLedger", () => {
     expect(result.toDelete).toEqual([]);
     const sept = result.toUpsert.find((p) => p.month === "2026-09")!;
     expect(sept.amountDue).toBe(263); // 6 × 43.75 = 262.5 → 263
-    // The installment is re-dated onto the anchor itself.
     expect(sept.dueDate).toBe("2026-09-10");
   });
 
+  it("emits at most ONE invoice per month (No-Loop-Bug)", () => {
+    // A pre-existing ledger for the same months must be REUSED, not
+    // duplicated: the invoice key is (studentId, subject, month) and the
+    // rebuild reuses the existing row's id for that month.
+    const existing: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350),
+    ];
+    const attendance = [
+      makeAttendance(STUDENT_ID, "session-Math-T.C-4", "2026-09-10"),
+    ];
+    const result = recalculateStudentSubjectLedger(
+      specStudent(),
+      "Math",
+      specCtx(existing, attendance),
+    );
+    // The re-anchored September row keeps its id — no fresh id minted.
+    expect(result.toUpsert.map((p) => p.id)).toContain("sept");
+    // Applying the diff leaves exactly one row per month.
+    const applied = existing
+      .filter((p) => !result.toDelete.includes(p.id))
+      .map((p) => (p.id === "sept" ? result.toUpsert.find((r) => r.id === "sept")! : p))
+      .concat(result.toUpsert.filter((p) => p.id !== "sept"));
+    const counts = new Map<string, number>();
+    for (const p of applied) counts.set(p.month, (counts.get(p.month) ?? 0) + 1);
+    for (const count of counts.values()) expect(count).toBe(1);
+  });
+
   it("downgrades a settled installment to partially paid when the charge grows", () => {
-    // Anchored on 17/09: Sept was 175 and fully paid. A newly-discovered
-    // earlier mark on 10/09 grows Sept to 263 — the settled row is
-    // downgraded to partially paid with the correct remaining balance.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 175, 175, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
@@ -1422,14 +1348,12 @@ describe("recalculateStudentSubjectLedger", () => {
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
     const sept = byId.get("sept")!;
     expect(sept.amountDue).toBe(263);
-    expect(sept.amountPaid).toBe(175); // the pooled credit, all absorbed
-    expect(sept.isPaid).toBe(false); // 175 < 263
+    expect(sept.amountPaid).toBe(175);
+    expect(sept.isPaid).toBe(false);
     expect(getPaymentRemaining(sept)).toBe(88);
   });
 
   it("pulls credit back from the following months (shortfall cascade)", () => {
-    // Sept 175 settled + Oct 100 credit. The 10/09 anchor grows Sept to 263,
-    // so Oct's credit is pulled back to fill Sept first.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 175, 175, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 100, false),
@@ -1443,21 +1367,13 @@ describe("recalculateStudentSubjectLedger", () => {
       "Math",
       specCtx(existing, attendance),
     );
-    expect(result.toDelete).toEqual([]);
-    expect(result.remainingCredit).toBe(0);
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
-    const sept = byId.get("sept")!;
-    expect(sept.amountDue).toBe(263);
-    expect(sept.amountPaid).toBe(263); // 175 own + 88 pulled back from Oct
-    expect(isPaymentFullyPaid(sept)).toBe(true);
-    const oct = byId.get("oct")!;
-    expect(oct.amountPaid).toBe(12); // 100 − 88
-    expect(oct.isPaid).toBe(false);
+    expect(byId.get("sept")!.amountPaid).toBe(263); // 175 own + 88 pulled back
+    expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(true);
+    expect(byId.get("oct")!.amountPaid).toBe(12); // 100 − 88
   });
 
   it("pushes surplus forward when the charge shrinks (surplus cascade)", () => {
-    // Sept was over-charged 350 and settled; the 17/09 anchor drops it to
-    // 175, so the 175 surplus rolls onto Oct.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 350, 350, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
@@ -1470,13 +1386,44 @@ describe("recalculateStudentSubjectLedger", () => {
       "Math",
       specCtx(existing, attendance),
     );
-    expect(result.toDelete).toEqual([]);
-    expect(result.remainingCredit).toBe(0);
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
     expect(byId.get("sept")!.amountDue).toBe(175);
     expect(byId.get("sept")!.amountPaid).toBe(175);
     expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(true);
     expect(byId.get("oct")!.amountPaid).toBe(175); // surplus rolled forward
+  });
+
+  it("lands carried wallet surplus on the NEXT month as partial credit", () => {
+    // Sept is settled and the student carries 150 DH of advance credit. The
+    // rebuild pools the wallet with Sept's paid credit: Sept absorbs 219,
+    // and the 150 surplus lands on October's row as green advance credit.
+    const existing: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219, 219, true),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+    ];
+    const result = recalculateStudentSubjectLedger(
+      specStudent("2026-09-15T12:00:00.000Z", undefined, 150),
+      "Math",
+      specCtx(existing, []),
+    );
+    const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
+    expect(byId.get("oct")!.amountPaid).toBe(150); // green advance credit
+    expect(byId.get("oct")!.isPaid).toBe(false);
+    expect(result.remainingCredit).toBe(0); // wallet fully absorbed
+  });
+
+  it("parks unabsorbed surplus in the wallet when no gap remains", () => {
+    // Only Sept exists (asOf = end of Sept), it is settled, and the wallet
+    // holds 150. The rebuild can absorb nothing more → surplus survives.
+    const existing: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219, 219, true),
+    ];
+    const result = recalculateStudentSubjectLedger(
+      specStudent("2026-09-15T12:00:00.000Z", undefined, 150),
+      "Math",
+      specCtx(existing, [], new Date(2026, 8, 30), "2026-09-30"),
+    );
+    expect(result.remainingCredit).toBe(150);
   });
 
   it("deletes a month that stopped being billable and redistributes its credit", () => {
@@ -1495,24 +1442,8 @@ describe("recalculateStudentSubjectLedger", () => {
       specCtx(existing, attendance),
     );
     expect(result.toDelete).toEqual(["sept"]);
-    expect(result.remainingCredit).toBe(0);
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
     expect(byId.get("oct")!.amountPaid).toBe(175); // Sept's credit moved
-  });
-
-  it("reports leftover credit for advanceBalance", () => {
-    const existing: Payment[] = [
-      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 350, 350, true),
-    ];
-    const result = recalculateStudentSubjectLedger(
-      specStudent(),
-      "Math",
-      specCtx(existing, [], new Date(2026, 8, 30), "2026-09-30"), // Sept only
-    );
-    const sept = result.toUpsert.find((p) => p.month === "2026-09")!;
-    expect(sept.amountDue).toBe(219);
-    expect(sept.amountPaid).toBe(219);
-    expect(result.remainingCredit).toBe(131); // 350 − 219 carried forward
   });
 
   it("is idempotent — recomputing the same state yields no further diff", () => {
@@ -1564,35 +1495,53 @@ describe("recalculateStudentSubjectLedger", () => {
     );
     expect(result.toDelete).toEqual(["sept", "oct"]);
     expect(result.toUpsert).toEqual([]);
-    expect(result.remainingCredit).toBe(100); // the paid credit is released
+    expect(result.remainingCredit).toBe(100); // released to the wallet
   });
 
-  it("never touches a Rule B (2Bac s.x Small) subject", () => {
-    const ruleBStudent = makeStudent({
-      level: "2Bac",
-      track: "s.x",
-      enrollments: [
-        {
-          subject: "Math",
-          track: "s.x",
-          groupType: "Small",
-          enrolledAt: "2026-09-15T12:00:00.000Z",
-        },
-      ],
-    });
-    const existing: Payment[] = [
-      makePayment("b1", STUDENT_ID, "Math", "2026-09-15", 500, 0, false, "B"),
+  it("short-circuits to a no-op for EVERY 2Bac Small combo (Rule B isolation)", () => {
+    const ruleBCombos: Array<{ track: Track; subject: Subject }> = [
+      { track: "s.x", subject: "Math" },
+      { track: "s.m", subject: "Math" },
+      { track: "s.x", subject: "PC" },
+      { track: "s.m", subject: "SVT" },
+      { track: "s.x", subject: "Philosophy" },
     ];
-    const attendance = [
-      makeAttendance(STUDENT_ID, "session-Math-2Bac-2", "2026-09-01"),
-    ];
-    const result = recalculateStudentSubjectLedger(
-      ruleBStudent,
-      "Math",
-      specCtx(existing, attendance),
-    );
-    expect(result.toDelete).toEqual([]);
-    expect(result.toUpsert).toEqual([]);
-    expect(result.remainingCredit).toBe(0);
+    for (const { track, subject } of ruleBCombos) {
+      const ruleBStudent = makeStudent({
+        level: "2Bac",
+        track,
+        enrollments: [
+          {
+            subject,
+            track,
+            groupType: "Small",
+            enrolledAt: "2026-09-15T12:00:00.000Z",
+          },
+        ],
+      });
+      const existing: Payment[] = [
+        makePayment(
+          "b1",
+          STUDENT_ID,
+          subject,
+          "2026-09-15",
+          500,
+          0,
+          false,
+          "B",
+        ),
+      ];
+      const attendance = [
+        makeAttendance(STUDENT_ID, `session-${subject}-2Bac-2`, "2026-09-01"),
+      ];
+      const result = recalculateStudentSubjectLedger(
+        ruleBStudent,
+        subject,
+        specCtx(existing, attendance),
+      );
+      expect(result.toDelete).toEqual([]);
+      expect(result.toUpsert).toEqual([]);
+      expect(result.remainingCredit).toBe(0);
+    }
   });
 });

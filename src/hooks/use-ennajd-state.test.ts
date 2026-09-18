@@ -160,14 +160,12 @@ function resetStore() {
 /**
  * Seeds a hydrated Rule A ledger: student + timetable + price, and the
  * installments a pre-mark sync would have built off the ENROLLMENT anchor
- * (Sept = 219 for the 15/09 joiner). `hasSyncedPayments` is on and the daily
- * sync key is already today — so a recalc that moves the ledger proves it
- * bypassed the daily throttle.
+ * (Sept = 219 for the 15/09 joiner).
  */
-function seedRuleALedger(payments: Payment[]) {
+function seedRuleALedger(payments: Payment[], advanceBalance = 0) {
   resetStore();
   useEnnajdState.setState({
-    students: [STUDENT],
+    students: [{ ...STUDENT, advanceBalance }],
     sessions: SESSIONS,
     prices: PRICES,
     payments,
@@ -221,9 +219,8 @@ function paymentFor(
   };
 }
 
-/** The recalc is queued on a microtask and awaits internal work (the forced
- *  sync + its own batch writes), so let the microtask queue drain plenty of
- *  turns before asserting. */
+/** The recalc is queued on a microtask and awaits its own batch writes, so
+ *  let the microtask queue drain plenty of turns before asserting. */
 async function flushReactive() {
   for (let i = 0; i < 25; i++) await Promise.resolve();
 }
@@ -234,15 +231,38 @@ function ledgerByMonth(): Map<string, Payment> {
   return new Map(useEnnajdState.getState().payments.map((p) => [p.month, p]));
 }
 
+/** The student's current wallet balance. */
+function walletBalance(): number {
+  return (
+    useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
+      .advanceBalance ?? 0
+  );
+}
+
+/** Every row handed to the batch upsert so far in this test. */
+async function upsertedRows(): Promise<Payment[]> {
+  const db = await import("@/lib/dbServices");
+  return vi.mocked(db.upsertPaymentsBatchDoc).mock.calls.flatMap((call) => call[0]);
+}
+
+/** Every per-id patch handed to the batch update so far in this test. */
+async function patchedRows(): Promise<Array<{ id: string }>> {
+  const db = await import("@/lib/dbServices");
+  return vi.mocked(db.updatePaymentsBatchDoc).mock.calls.flatMap((call) => call[0]);
+}
+
 /** Every payment id handed to `deletePaymentsBatchDoc` so far in this test. */
 async function deletePaymentsBatchDocIds(): Promise<string[]> {
   const db = await import("@/lib/dbServices");
-  // `mock.calls[i][0]` is the FIRST ARGUMENT of call i (the ids array) —
-  // flattening one level of `calls` instead would leave an extra nesting and
-  // make every `toContain` assertion silently pass on the wrong shape.
-  return vi
-    .mocked(db.deletePaymentsBatchDoc)
-    .mock.calls.flatMap((call) => call[0]);
+  return vi.mocked(db.deletePaymentsBatchDoc).mock.calls.flatMap((call) => call[0]);
+}
+
+/** Asserts the ledger keeps exactly one row per month — no duplicate ids. */
+function expectOneRowPerMonth() {
+  const months = useEnnajdState.getState().payments.map((p) => p.month);
+  const counts = new Map<string, number>();
+  for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
+  for (const count of counts.values()) expect(count).toBe(1);
 }
 
 describe("reactive ledger — markAttendance trigger", () => {
@@ -252,9 +272,35 @@ describe("reactive ledger — markAttendance trigger", () => {
     resetStore();
   });
 
+  it("populates an EMPTY ledger from a fresh attendance mark (the empty-ledger regression)", async () => {
+    // The reported symptom: the ledger stays completely empty after marking
+    // attendance. The old recalc bailed silently on `!hasSyncedPayments`;
+    // the rebuild fires unconditionally.
+    resetStore();
+    useEnnajdState.setState({
+      students: [STUDENT],
+      sessions: SESSIONS,
+      prices: PRICES,
+      payments: [], // nothing generated yet
+      hasSyncedPayments: false, // the old gate
+    });
+
+    const ok = await useEnnajdState
+      .getState()
+      .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
+    expect(ok).toBe(true);
+    await flushReactive();
+
+    const ledger = ledgerByMonth();
+    expect(ledger.size).toBeGreaterThan(0);
+    // The 10/09 mark predates registration but is INCLUSIVE — Sept re-bills
+    // to 6 × 43.75 = 263 and is dated on the anchor.
+    expect(ledger.get("2026-09")!.amountDue).toBe(263);
+    expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
+    expect(ledger.get("2026-10")!.amountDue).toBe(350);
+  });
+
   it("re-bills Sept from a pre-registration attendance mark", async () => {
-    // No attendance yet → ledger sits on the 15/09 enrollment anchor: Sept
-    // 219 (5 × 43.75), Oct/Nov full 350.
     seedRuleALedger([
       payment("sept", "2026-09-15", 219),
       payment("oct", "2026-10-01", 350),
@@ -267,8 +313,6 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(ok).toBe(true);
     await flushReactive();
 
-    // The 10/09 mark predates registration but is INCLUSIVE — Sept re-bills
-    // to 6 × 43.75 = 263 and is re-dated onto the anchor.
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountDue).toBe(263);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
@@ -286,11 +330,8 @@ describe("reactive ledger — markAttendance trigger", () => {
       .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
     await flushReactive();
 
-    const months = useEnnajdState.getState().payments.map((p) => p.month);
-    const counts = new Map<string, number>();
-    for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
-    for (const [month, count] of counts) expect(count).toBe(1);
-    expect(counts.get("2026-09")).toBe(1);
+    expectOneRowPerMonth();
+    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(263);
   });
 
   it("cascades a settled installment's surplus into the following months", async () => {
@@ -312,10 +353,59 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(ledger.get("2026-10")!.amountPaid).toBe(175); // surplus forwarded
   });
 
+  it("lands carried wallet surplus on the NEXT month as green advance credit", async () => {
+    // Sept settled, 150 DH parked in the wallet. A mark on the enrollment
+    // date re-derives the ledger; the rebuild pools the wallet and lands the
+    // 150 surplus on October's gap.
+    seedRuleALedger(
+      [
+        payment("sept", "2026-09-15", 219, "A", 219),
+        payment("oct", "2026-10-01", 350),
+      ],
+      150, // advanceBalance
+    );
+    vi.clearAllMocks();
+
+    await useEnnajdState
+      .getState()
+      .markAttendance(STUDENT_ID, "session-math-tue", "2026-09-15", "present");
+    await flushReactive();
+
+    const ledger = ledgerByMonth();
+    expect(ledger.get("2026-10")!.amountPaid).toBe(150); // green credit
+    expect(ledger.get("2026-10")!.isPaid).toBe(false);
+    expect(walletBalance()).toBe(0); // wallet drained
+
+    const db = await import("@/lib/dbServices");
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 0);
+  });
+
+  it("commits the rebuild in ONE payments write (single-write contract)", async () => {
+    seedRuleALedger([
+      payment("sept", "2026-09-15", 219),
+      payment("oct", "2026-10-01", 350),
+    ]);
+    vi.clearAllMocks();
+
+    await useEnnajdState
+      .getState()
+      .markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
+    await flushReactive();
+
+    const db = await import("@/lib/dbServices");
+    // Exactly ONE payments write for the whole recalc — there is no second
+    // per-id update whose echo could revert the rebuilt rows.
+    expect(db.upsertPaymentsBatchDoc).toHaveBeenCalledTimes(1);
+    expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
+    // The shipped rows already carry their waterfall credit, and no id ships
+    // twice (PostgREST "cannot affect row a second time").
+    const rows = await upsertedRows();
+    expect(rows.length).toBeGreaterThan(0);
+    const ids = rows.map((p) => p.id);
+    expect(ids).toEqual([...new Set(ids)]);
+  });
+
   it("confirms the recalc with a toast naming the student", async () => {
-    // Over-charged settled Sept: the forced sync re-anchors Sept to 175 and
-    // leaves the 175 surplus on the row, and the recalc then cascades that
-    // surplus onto Oct — real ledger work the toast confirms.
     seedRuleALedger([
       payment("sept", "2026-09-15", 350, "A", 350),
       payment("oct", "2026-10-01", 350),
@@ -327,9 +417,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     await flushReactive();
 
     expect(toast.success).toHaveBeenCalledTimes(1);
-    expect(toast.success).toHaveBeenCalledWith(
-      expect.stringContaining("Aicha"),
-    );
+    expect(toast.success).toHaveBeenCalledWith(expect.stringContaining("Aicha"));
   });
 
   it("is idempotent — a second mark of the same date moves nothing", async () => {
@@ -338,8 +426,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     const store = useEnnajdState.getState();
     await store.markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
     await flushReactive();
-    const afterFirst = ledgerByMonth().get("2026-09")!.amountDue;
-    expect(afterFirst).toBe(263);
+    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(263);
 
     toast.success.mockClear();
     // Same student+session+date → the existing record is replaced, the anchor
@@ -381,19 +468,13 @@ describe("reactive ledger — markAttendance trigger", () => {
     const upsertOrders = vi.mocked(db.upsertPaymentsBatchDoc).mock.invocationCallOrder;
     expect(deleteOrders.length).toBeGreaterThan(0);
     expect(upsertOrders.length).toBeGreaterThan(0);
-    // EVERY delete lands before EVERY upsert (the collapse in the forced
-    // sync, and the reactive recalc's own rebuild, both write in this order).
-    const lastDelete = Math.max(...deleteOrders);
-    const firstUpsert = Math.min(...upsertOrders);
-    expect(lastDelete).toBeLessThan(firstUpsert);
+    // EVERY delete lands before EVERY upsert.
+    expect(Math.max(...deleteOrders)).toBeLessThan(Math.min(...upsertOrders));
 
     // The surplus Sept row is gone...
     expect(await deletePaymentsBatchDocIds()).toContain("sept-dup");
     // ...and exactly one row per month survived.
-    const months = useEnnajdState.getState().payments.map((p) => p.month);
-    const counts = new Map<string, number>();
-    for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
-    for (const count of counts.values()) expect(count).toBe(1);
+    expectOneRowPerMonth();
   });
 
   it("never blocks on a persistence failure (warning toast, kept attendance)", async () => {
@@ -407,15 +488,14 @@ describe("reactive ledger — markAttendance trigger", () => {
 
     // The attendance write itself landed and stays recorded...
     expect(ok).toBe(true);
-    const records: AttendanceRecord[] =
-      useEnnajdState.getState().attendanceRecords;
+    const records: AttendanceRecord[] = useEnnajdState.getState().attendanceRecords;
     expect(records).toHaveLength(1);
     expect(records[0].date).toBe("2026-09-10");
     // ...and the recalc failure surfaced as a warning, never an error throw.
     expect(toast.warning).toHaveBeenCalled();
   });
 
-  it("leaves a Rule B (2Bac s.x Small) ledger on its fixed schedule", async () => {
+  it("leaves a Rule B (2Bac Small) ledger on its fixed schedule", async () => {
     resetStore();
     useEnnajdState.setState({
       students: [
@@ -434,33 +514,10 @@ describe("reactive ledger — markAttendance trigger", () => {
           ],
         },
       ],
-      sessions: [
-        {
-          id: "session-math-2bac",
-          subject: "Math",
-          level: "2Bac",
-          track: "s.x",
-          groupType: "Small",
-          dayOfWeek: 2,
-          startTime: "16:00",
-          endTime: "18:00",
-          kind: "recurring",
-          date: null,
-        },
-      ],
-      prices: [
-        {
-          id: "price-math-2bac",
-          level: "2Bac",
-          subject: "Math",
-          track: "s.x",
-          groupType: "Small",
-          price: 500,
-        },
-      ],
-      // The full Rule B rolling cycle through the generation horizon
-      // (now + 1 month) already exists, so generation is a no-op and the
-      // only thing that could move the ledger is the recalc.
+      sessions: [SESSION_2BAC],
+      prices: [PRICE_2BAC],
+      // The full Rule B rolling cycle through the generation horizon already
+      // exists, so the only thing that could move the ledger is the recalc.
       payments: [
         payment("b-sept", "2026-09-15", 500, "B"),
         payment("b-oct", "2026-10-15", 500, "B"),
@@ -486,8 +543,11 @@ describe("reactive ledger — markAttendance trigger", () => {
       "2026-11-15",
       "2026-12-15",
     ]);
-    // Nothing moved, so no confirmation toast.
+    // Nothing moved, so no confirmation toast and no writes.
     expect(toast.success).not.toHaveBeenCalled();
+    const db = await import("@/lib/dbServices");
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.deletePaymentsBatchDoc).not.toHaveBeenCalled();
   });
 });
 
@@ -500,8 +560,6 @@ describe("regeneratePaymentLedger", () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     resetStore();
-    // The db mocks accumulate calls across this file's tests — clear them so
-    // this block can assert exact call counts and call ORDER.
     vi.clearAllMocks();
   });
 
@@ -560,9 +618,7 @@ describe("regeneratePaymentLedger", () => {
       }),
     );
     // The local ledger is rolled back to its pre-rebuild state.
-    expect(useEnnajdState.getState().payments.map((p) => p.id)).toEqual([
-      "sept",
-    ]);
+    expect(useEnnajdState.getState().payments.map((p) => p.id)).toEqual(["sept"]);
   });
 });
 
@@ -602,17 +658,10 @@ describe("recordPartialPayment — waterfall", () => {
     // November untouched — the waterfall stops when the credit runs out.
     expect(ledger.get("2026-11")!.amountPaid).toBe(0);
 
-    // Exactly one row per month — the waterfall never mints a duplicate.
-    const months = useEnnajdState.getState().payments.map((p) => p.month);
-    const counts = new Map<string, number>();
-    for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
-    for (const count of counts.values()) expect(count).toBe(1);
+    expectOneRowPerMonth();
 
     // The surplus was absorbed, so nothing was parked in advanceBalance.
-    expect(
-      useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
-        .advanceBalance ?? 0,
-    ).toBe(0);
+    expect(walletBalance()).toBe(0);
 
     // SINGLE-WRITE CONTRACT — the realtime echo race fix. The whole waterfall
     // commits as exactly ONE payments write; there is no second per-id update
@@ -627,8 +676,7 @@ describe("recordPartialPayment — waterfall", () => {
     expect(oct).toBeDefined();
     expect(oct!.amountPaid).toBe(175);
     expect(oct!.isPaid).toBe(false);
-    // No id ships twice in the batch (PostgREST "cannot affect row a second
-    // time"); the credit is merged onto the rows, never appended as a copy.
+    // No id ships twice in the batch.
     const ids = (await upsertedRows()).map((p) => p.id);
     expect(ids).toEqual([...new Set(ids)]);
   });
@@ -636,9 +684,7 @@ describe("recordPartialPayment — waterfall", () => {
   it("parks surplus in advanceBalance when every installment is fully paid", async () => {
     // Latent lost-credit bug: with no gap anywhere (all installments through
     // the generation horizon are settled), the credit can be absorbed by
-    // nothing and must land in the wallet. The old two-write path only parked
-    // surplus inside its `anyChanged` branch — false here — and silently
-    // dropped the ENTIRE payment.
+    // nothing and must land in the wallet.
     seedRuleALedger([
       payment("sept", "2026-09-15", 350, "A", 350),
       payment("oct", "2026-10-01", 350, "A", 350),
@@ -656,10 +702,7 @@ describe("recordPartialPayment — waterfall", () => {
     // ONLY write. No payments echo at all, so nothing can revert the store.
     expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
     expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
-    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
-      STUDENT_ID,
-      200,
-    );
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 200);
   });
 });
 
@@ -667,9 +710,7 @@ describe("recordPartialPayment — waterfall", () => {
 // applyInitialTuitionPayment — the create-time cross-subject waterfall. Same
 // single-write contract as recordPartialPayment: the fully-waterfalled rows
 // ship in ONE upsert (credit merged in place, never appended as copies), and
-// unabsorbed surplus always reaches advanceBalance — the old path early-
-// returned `if (!anyChanged)` and dropped the payment when nothing could
-// absorb it.
+// unabsorbed surplus always reaches advanceBalance.
 // ---------------------------------------------------------------------------//
 
 // A Monday PC slot alongside the Tue/Thu Math slots, so the student is
@@ -748,7 +789,7 @@ describe("applyInitialTuitionPayment — single-write cross-subject waterfall", 
     expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
 
     // The credited EXISTING rows ship as full rows already carrying their
-    // credit — the echo can only re-deliver these exact amounts.
+    // credit — the echo can only ever re-deliver these exact amounts.
     const byId = new Map((await upsertedRows()).map((p) => [p.id, p]));
     expect(byId.get("m-sept")!.amountPaid).toBe(350);
     expect(byId.get("p-sept")!.amountPaid).toBe(150);
@@ -769,8 +810,6 @@ describe("applyInitialTuitionPayment — single-write cross-subject waterfall", 
   it("parks unabsorbed surplus in advanceBalance (latent lost-credit fix)", async () => {
     // Every installment through the generation horizon is already settled, so
     // the waterfall has no gap and the whole payment must survive as surplus.
-    // The old path's `if (!anyChanged) return` dropped it without writing the
-    // wallet at all.
     seedCrossSubjectLedger([
       paymentFor("Math", "m-sept", "2026-09-15", 350, 350),
       paymentFor("Math", "m-oct", "2026-10-01", 350, 350),
@@ -788,14 +827,9 @@ describe("applyInitialTuitionPayment — single-write cross-subject waterfall", 
 
     const db = await import("@/lib/dbServices");
     expect(walletBalance()).toBe(200);
-    // Nothing generated and no credit landed → the wallet write is the ONLY
-    // write, so no payments echo can revert the store.
     expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
     expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
-    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
-      STUDENT_ID,
-      200,
-    );
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 200);
   });
 
   it("reverts the ledger and rethrows when the write fails", async () => {
@@ -826,13 +860,6 @@ describe("applyInitialTuitionPayment — single-write cross-subject waterfall", 
 // syncPayments — the daily self-heal, and the wallet (advanceBalance)
 // carryover regression. Credit parked in the wallet from an earlier
 // over-payment must land on the next month's installment, applied IN PLACE.
-// The old code appended full credited COPIES alongside the rows they patched:
-// two ledger rows sharing one id broke the one-row-per-month invariant (the
-// red panel then summed the stale copy AND the credited one) and put two rows
-// sharing a primary key in a single batch upsert — PostgREST rejects that
-// with "cannot affect row a second time", rolling back the WHOLE commit and
-// stranding the carryover in the wallet (the next month then re-showed its
-// full amount in red, ignoring the credit).
 // ---------------------------------------------------------------------------//
 
 /** Wallet credit carried into the sync (MAD). */
@@ -873,11 +900,7 @@ function seedWalletLedger(payments: Payment[], advanceBalance: number) {
 }
 
 /** A Rule B installment: 500 MAD due on the 15th of `month`. */
-function ruleBPayment(
-  id: string,
-  month: string,
-  amountPaid = 0,
-): Payment {
+function ruleBPayment(id: string, month: string, amountPaid = 0): Payment {
   return {
     id,
     studentId: STUDENT_ID,
@@ -891,38 +914,6 @@ function ruleBPayment(
     rule: "B",
     updatedAt: "2026-09-15T00:00:00.000Z",
   };
-}
-
-/** The student's current wallet balance. */
-function walletBalance(): number {
-  return (
-    useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
-      .advanceBalance ?? 0
-  );
-}
-
-/** Every row handed to the batch upsert so far in this test. */
-async function upsertedRows(): Promise<Payment[]> {
-  const db = await import("@/lib/dbServices");
-  return vi
-    .mocked(db.upsertPaymentsBatchDoc)
-    .mock.calls.flatMap((call) => call[0]);
-}
-
-/** Every per-id patch handed to the batch update so far in this test. */
-async function patchedRows(): Promise<Array<{ id: string }>> {
-  const db = await import("@/lib/dbServices");
-  return vi
-    .mocked(db.updatePaymentsBatchDoc)
-    .mock.calls.flatMap((call) => call[0]);
-}
-
-/** Asserts the ledger keeps exactly one row per month — no duplicate ids. */
-function expectOneRowPerMonth() {
-  const months = useEnnajdState.getState().payments.map((p) => p.month);
-  const counts = new Map<string, number>();
-  for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
-  for (const count of counts.values()) expect(count).toBe(1);
 }
 
 describe("syncPayments — wallet carryover to the next month", () => {
@@ -946,9 +937,7 @@ describe("syncPayments — wallet carryover to the next month", () => {
       WALLET,
     );
 
-    await useEnnajdState
-      .getState()
-      .syncPayments(new Date(NOW), { force: true });
+    await useEnnajdState.getState().syncPayments(new Date(NOW), { force: true });
 
     const db = await import("@/lib/dbServices");
 
@@ -961,27 +950,20 @@ describe("syncPayments — wallet carryover to the next month", () => {
     // The wallet was drained — the carryover did not linger.
     expect(walletBalance()).toBe(0);
 
-    // Exactly one row per month — the credit never minted a second December.
     expectOneRowPerMonth();
 
     // The generated + credited December row ships in the UPSERT batch...
     const upserted = await upsertedRows();
     expect(upserted.map((p) => p.id)).toEqual([dec!.id]);
-    // ...and NEVER ALSO in the per-id update batch. That double-write is what
-    // put two rows sharing a primary key in one commit and stranded the
-    // carryover in the wallet when the batch was rejected.
+    // ...and NEVER ALSO in the per-id update batch.
     const patched = await patchedRows();
     expect(patched.map((p) => p.id)).not.toContain(dec!.id);
     // No id is written twice across the whole commit.
     const writtenIds = [...upserted, ...patched].map((p) => p.id);
     expect(writtenIds).toEqual([...new Set(writtenIds)]);
 
-    // The wallet drain itself was persisted — the missing write that used to
-    // lose carried-forward credit on refresh.
-    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
-      STUDENT_ID,
-      0,
-    );
+    // The wallet drain itself was persisted.
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 0);
   });
 
   it("patches an EXISTING row's credit per-id, never appends a duplicate", async () => {
@@ -998,9 +980,7 @@ describe("syncPayments — wallet carryover to the next month", () => {
       WALLET,
     );
 
-    await useEnnajdState
-      .getState()
-      .syncPayments(new Date(NOW), { force: true });
+    await useEnnajdState.getState().syncPayments(new Date(NOW), { force: true });
 
     const db = await import("@/lib/dbServices");
 
@@ -1016,13 +996,11 @@ describe("syncPayments — wallet carryover to the next month", () => {
     expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
     // ...the credit ships as ONE per-id UPDATE on the existing row only.
     expect(db.updatePaymentsBatchDoc).toHaveBeenCalledTimes(1);
-    const patches = vi.mocked(db.updatePaymentsBatchDoc).mock
-      .calls[0][0] as Array<{ id: string }>;
+    const patches = vi.mocked(db.updatePaymentsBatchDoc).mock.calls[0][0] as Array<{
+      id: string;
+    }>;
     expect(patches.map((p) => p.id)).toEqual(["b-dec"]);
-    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(
-      STUDENT_ID,
-      0,
-    );
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 0);
 
     expectOneRowPerMonth();
   });
@@ -1041,9 +1019,7 @@ describe("syncPayments — wallet carryover to the next month", () => {
       WALLET,
     );
 
-    await useEnnajdState
-      .getState()
-      .syncPayments(new Date(NOW), { force: true });
+    await useEnnajdState.getState().syncPayments(new Date(NOW), { force: true });
 
     const db = await import("@/lib/dbServices");
     expect(walletBalance()).toBe(WALLET);
@@ -1053,4 +1029,3 @@ describe("syncPayments — wallet carryover to the next month", () => {
     expectOneRowPerMonth();
   });
 });
-

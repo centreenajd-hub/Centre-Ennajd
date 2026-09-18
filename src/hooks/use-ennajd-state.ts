@@ -2,12 +2,19 @@
 // Every future phase (Attendance, Payments, PDF exports) reads/writes state
 // exclusively through this store.
 //
-// Persistence: this store no longer uses localStorage (`persist`). Instead,
-// every write action also pushes the same record to Firestore (via
-// `dbServices`), and `hydrate*` actions — called only by
-// `useFirestoreSync()` — replace slices of state whenever Firestore's
-// real-time listeners fire (initial load, remote changes, or the local
-// offline queue flushing).
+// Persistence: this store does not use localStorage (`persist`). Every write
+// action also pushes the same record to Supabase (via `dbServices`), and the
+// `hydrate*` actions — called only by `useFirestoreSync()` — replace slices
+// of state whenever the realtime listeners fire (initial load, remote
+// changes, or the local offline queue flushing).
+//
+// REACTIVE LEDGER: marking attendance on the Dashboard re-derives that
+// student+subject's Rule A ledger immediately (`markAttendance` →
+// `recalculatePaymentsForStudentSubject`), with no hydration gate and no
+// throttle. The rebuild is committed in ONE payments write whose rows
+// already carry their waterfall credit, plus one `advanceBalance` write on
+// the students table (a separate realtime channel, so its echo can never
+// clobber the payments ledger).
 
 import { create } from "zustand";
 import { toast } from "sonner";
@@ -20,8 +27,6 @@ import {
   generateScheduleFor,
   getPaymentRuleFor,
   isMoreSettledPayment,
-  isPaymentFullyPaid,
-  getPaymentRemaining,
   recalculateStudentSubjectLedger,
   reconcileRuleALedger,
   REGISTRATION_FEE_DEFAULT,
@@ -73,6 +78,99 @@ function formatTimeKey(date: Date): string {
   const h = String(date.getHours()).padStart(2, "0");
   const m = String(date.getMinutes()).padStart(2, "0");
   return `${h}:${m}`;
+}
+
+function makeId(): string {
+  return crypto.randomUUID();
+}
+
+/**
+ * Extracts the meaningful technical detail of a persistence failure —
+ * Supabase/PostgREST errors carry `code`/`message`/`details`, plain Errors
+ * only a `message`. Used so a payment write failure shows the REAL reason
+ * (unique-constraint violation, check constraint, RLS…) instead of a generic
+ * "something went wrong".
+ */
+function summarizePersistenceError(err: unknown): string {
+  if (err && typeof err === "object") {
+    const e = err as { code?: string; message?: string; details?: string };
+    const parts = [e.code, e.message, e.details].filter(
+      (v): v is string => typeof v === "string" && v.length > 0,
+    );
+    if (parts.length > 0) return parts.join(" · ");
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/**
+ * Logs a payment-write failure with its full technical detail and surfaces a
+ * translated toast including that detail, so a Supabase rejection (unique
+ * constraint, `check (amount_due > 0)`, RLS…) is visible instead of swallowed.
+ */
+function logPaymentWriteFailure(scope: string, err: unknown): void {
+  console.error(`[ennajd] ${scope} failed:`, err);
+  toast.error(t("paymentSaveFailed"), {
+    description: t("paymentSaveFailedDetail").replace(
+      "{details}",
+      summarizePersistenceError(err),
+    ),
+  });
+}
+
+/**
+ * The store write contract: snapshot → optimistic `set` → await the doc
+ * write → revert + toast on failure. Every persistence write goes through
+ * here so a Supabase rejection can never silently leave the local store
+ * ahead of the database. Returns `true` when the write landed, `false` when
+ * it was rolled back — form dialogs awaiting an action gate their "saved"
+ * toast + close on it, so a rejected write keeps the dialog open instead of
+ * faking success.
+ */
+async function persist<T>(
+  prev: T,
+  revert: (prev: T) => void,
+  work: Promise<void>,
+  msg: DictKey,
+): Promise<boolean> {
+  try {
+    await work;
+    return true;
+  } catch (err) {
+    console.error("[ennajd] persistence write failed:", err);
+    revert(prev);
+    toast.error(t(msg));
+    return false;
+  }
+}
+
+/**
+ * Pure helper — total tuition (MAD) for a set of enrollments WITHOUT a
+ * persisted student.id (used at creation time, before the doc exists).
+ * Mirrors the billing layer's `getEffectivePriceFor`: `customPrice ?? base
+ * price` per enrollment.
+ */
+export function computeTuitionTotal(
+  enrollments: SubjectEnrollment[],
+  level: Level,
+  prices: PriceEntry[],
+): number {
+  let total = 0;
+  for (const enrollment of enrollments) {
+    if (enrollment.customPrice !== undefined) {
+      total += enrollment.customPrice;
+      continue;
+    }
+    const base = prices.find(
+      (p) =>
+        p.level === level &&
+        p.subject === enrollment.subject &&
+        p.track === enrollment.track &&
+        p.groupType === enrollment.groupType,
+    )?.price;
+    if (base !== undefined) total += base;
+  }
+  return total;
 }
 
 interface EnnajdState {
@@ -172,109 +270,11 @@ interface EnnajdState {
   hydrateMessages: (messages: LevelMessage[]) => void;
 }
 
-function makeId(): string {
-  return crypto.randomUUID();
-}
-
 /**
- * Extracts the meaningful technical detail of a persistence failure —
- * Supabase/PostgREST errors carry `code`/`message`/`details`, plain Errors
- * only a `message`. Used so a payment write failure shows the REAL reason
- * (unique-constraint violation, check constraint, RLS…) instead of a generic
- * "something went wrong".
- */
-function summarizePersistenceError(err: unknown): string {
-  if (err && typeof err === "object") {
-    const e = err as { code?: string; message?: string; details?: string };
-    const parts = [e.code, e.message, e.details].filter(
-      (v): v is string => typeof v === "string" && v.length > 0,
-    );
-    if (parts.length > 0) return parts.join(" · ");
-  }
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
-/**
- * Logs a payment-write failure with its full technical detail and surfaces a
- * translated toast that includes that detail, so a Supabase rejection (unique
- * constraint, `check (amount_due > 0)`, RLS…) is visible instead of swallowed.
- */
-function logPaymentWriteFailure(scope: string, err: unknown): void {
-  console.error(`[ennajd] ${scope} failed:`, err);
-  toast.error(t("paymentSaveFailed"), {
-    description: t("paymentSaveFailedDetail").replace(
-      "{details}",
-      summarizePersistenceError(err),
-    ),
-  });
-}
-
-/**
- * The store write contract: snapshot → optimistic `set` → await the doc
- * write → revert + toast on failure. Every persistence write goes through
- * here so a Supabase rejection can never silently leave the local store
- * ahead of the database (the "session/attendance vanished on refresh" bug:
- * the optimistic row was discarded by the next realtime fetch while the
- * failed insert was swallowed). `revert` restores the snapshotted slice and
- * the translated toast tells the user the truth.
- *
- * Returns `true` when the write landed, `false` when it was rolled back —
- * form dialogs awaiting an action gate their "saved" toast + close on it, so
- * a rejected write keeps the dialog open instead of faking success.
- */
-async function persist<T>(
-  prev: T,
-  revert: (prev: T) => void,
-  work: Promise<void>,
-  msg: DictKey,
-): Promise<boolean> {
-  try {
-    await work;
-    return true;
-  } catch (err) {
-    console.error("[ennajd] persistence write failed:", err);
-    revert(prev);
-    toast.error(t(msg));
-    return false;
-  }
-}
-
-/**
- * Pure helper — computes the total tuition (MAD) for a set of enrollments
- * WITHOUT requiring a persisted student.id (used at creation time, before the
- * student doc exists). Mirrors `getEffectivePrice` + `getBasePrice`:
- * `customPrice ?? base price` per enrollment. Returns 0 when no price is
- * defined for any enrollment (the caller disables the Paid input in that case).
- */
-export function computeTuitionTotal(
-  enrollments: SubjectEnrollment[],
-  level: Level,
-  prices: PriceEntry[],
-): number {
-  let total = 0;
-  for (const enrollment of enrollments) {
-    if (enrollment.customPrice !== undefined) {
-      total += enrollment.customPrice;
-      continue;
-    }
-    const base = prices.find(
-      (p) =>
-        p.level === level &&
-        p.subject === enrollment.subject &&
-        p.track === enrollment.track &&
-        p.groupType === enrollment.groupType,
-    )?.price;
-    if (base !== undefined) total += base;
-  }
-  return total;
-}
-
-/**
- * Throttle timestamps (ms epoch) for the two reactive-layer background jobs.
- * Module-level on purpose: both jobs are idempotent, shared across every
- * caller (Dashboard tick, Payments mount, ...), and never need to trigger a
- * re-render — so they don't belong inside the reactive state itself.
+ * Throttle timestamps (ms epoch) for the background jobs. Module-level on
+ * purpose: the jobs are idempotent, shared across every caller, and never
+ * need to trigger a re-render — so they don't belong inside reactive state.
+ * The attendance-triggered recalc deliberately bypasses ALL of these.
  */
 let lastAutoAbsenceSweepMs: number | null = null;
 let lastSyncPaymentsMs: number | null = null;
@@ -283,10 +283,9 @@ let lastExpiredSweepDateKey: string | null = null;
 /**
  * Generates any missing installments for a single student across all their
  * enrollments, up to `asOf`. Returns the newly-created payment rows (empty
- * when the schedule already exists). The caller is expected to commit them
- * to the local store + Firestore. This is the shared generation engine used
- * by `syncPayments`, `recordPartialPayment`, and `applyInitialTuitionPayment`
- * so future installments always exist before credit is applied.
+ * when the schedule already exists). Shared by `syncPayments`,
+ * `recordPartialPayment`, and `applyInitialTuitionPayment` so future
+ * installments always exist before credit is applied.
  */
 function generateInstallmentsForStudent(
   student: Student,
@@ -307,8 +306,9 @@ function generateInstallmentsForStudent(
       enrollment.track,
     );
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
-    // Rule A bills from the earliest ATTENDANCE date (enrollment fallback);
-    // Rule B keeps its fixed rolling cycle anchored on the enrollment date.
+    // Rule A bills from the student's earliest ATTENDANCE date (enrollment
+    // fallback) — the engine then anchors each month from that start. Rule B
+    // keeps its fixed rolling cycle anchored on the enrollment date.
     const anchor =
       rule === "B"
         ? enrolledAt
@@ -320,9 +320,11 @@ function generateInstallmentsForStudent(
             asOfKey,
           ) ?? enrolledAt;
     const fullPrice = state.getEffectivePrice(student.id, enrollment.subject);
+    // customPrice wins outright; undefined only when neither customPrice nor
+    // a base price exists — the combo is not billable.
     if (fullPrice === undefined) continue;
 
-    const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}__${anchor.getDay()}`;
+    const ctxKey = `${student.level}__${enrollment.subject}__${enrollment.track}__${enrollment.groupType}`;
     let ctx = ctxCache.get(ctxKey);
     if (!ctx) {
       ctx = buildDeliveredDatesContext(
@@ -339,16 +341,11 @@ function generateInstallmentsForStudent(
       ctxCache.set(ctxKey, ctx);
     }
 
-    // Session-based engine (Rule A) / rolling cycle (Rule B): the schedule
-    // already carries ABSOLUTE amounts (perSession × billable sessions),
-    // resolved from getEffectivePrice (which honors customPrice).
     const schedule = generateScheduleFor(rule, anchor, asOf, ctx, fullPrice);
     for (const installment of schedule) {
-      // MONTH-keyed guard: a moved anchor re-dates the join month onto a new
-      // dueDate, and a dueDate-keyed guard would then mint a SECOND row for
-      // a month that already has one (the 438 = 219 + 219 leak). Keying on
-      // rule + calendar month keeps exactly one row per month; the reconcile
-      // pass then corrects that row's amount + dueDate in place.
+      // MONTH-keyed guard: exactly one row per (student, subject, rule,
+      // month) — the No-Loop-Bug invariant. A re-mark reuses the existing
+      // row instead of minting a second invoice for the same month.
       const key = `${student.id}__${enrollment.subject}__${rule}__${installment.monthKey}`;
       if (existingKeys.has(key)) continue;
       existingKeys.add(key);
@@ -376,35 +373,30 @@ function generateInstallmentsForStudent(
  * `recordPartialPayment` (per-subject) and `applyInitialTuitionPayment`
  * (cross-subject, `subject === null`).
  *
- * The race this exists to kill: the old paths did TWO sequential `payments`
- * writes — an upsert of the freshly-generated installments (amountPaid: 0),
- * then a per-id `updatePaymentsBatchDoc` applying the credit waterfall.
+ * The race this exists to kill: two sequential `payments` writes (an upsert
+ * of the freshly-generated rows, then a per-id update applying the credit).
  * Supabase realtime echoes both asynchronously; when WRITE 1's echo lands
- * AFTER WRITE 2's optimistic `set`, the store is reverted to the
- * pre-waterfall snapshot (October flips back to 0/red) even though the DB
- * already holds the credited amount. Collapsing both into ONE upsert means
- * one echo — and since the store holds byte-identical content to what that
- * echo delivers, `stableFingerprint` / `replaceIfChanged` recognise it as a
- * no-op and keep the current reference.
+ * AFTER WRITE 2's optimistic `set`, the store reverts to the pre-waterfall
+ * snapshot (a month flips back to red) even though the DB already holds the
+ * credited amount. Collapsing both into ONE upsert means one echo — and
+ * since the store holds byte-identical content to what that echo delivers,
+ * `replaceIfChanged` recognises it as a no-op and keeps the current
+ * reference.
  *
  * Nothing touches the DB until the FULLY-waterfalled final array is computed
- * in memory. `applyCreditWaterfall` runs over the LOCAL union of the previous
- * ledger + the caller-generated rows, and the credit patches are merged onto
- * the generated rows IN PLACE — never appended as copies, which would put two
- * rows sharing one id in a single batch and trip PostgREST's "cannot affect
- * row a second time". The final array is deduped by id via a Map so each id
- * ships exactly once.
+ * in memory. Credit patches are merged onto the generated rows IN PLACE —
+ * never appended as copies, which would put two rows sharing one id in a
+ * single batch and trip PostgREST's "cannot affect row a second time".
  *
  * `remaining` (unabsorbed surplus) is computed UNCONDITIONALLY and always
  * parked in `advanceBalance` when positive. The old paths only parked it
- * inside their `anyChanged` branch (and `applyInitialTuitionPayment` early-
- * returned `if (!anyChanged) return`), so when every installment was already
+ * inside their `anyChanged` branch, so when every installment was already
  * fully paid the ENTIRE payment was silently lost.
  *
  * `advanceBalance` stays a deliberate second write — it targets the
- * `students` table (a different realtime channel), so its echo cannot clobber
- * the payments ledger. Optimistic throughout: the store is set first and
- * rolled back to the snapshotted slices on failure.
+ * `students` table (a different realtime channel), so its echo cannot
+ * clobber the payments ledger. Optimistic throughout: the store is set
+ * first and rolled back to the snapshotted slices on failure.
  */
 async function commitWaterfallSingleWrite(args: {
   studentId: string;
@@ -447,8 +439,7 @@ async function commitWaterfallSingleWrite(args: {
   );
 
   // 3-4. Dedup-by-id final payload. Generated rows carry their credit patch
-  // IN PLACE; existing changed rows follow. Belt-and-braces Map dedup guards
-  // against a generated id ever colliding with an existing one.
+  // IN PLACE; existing changed rows follow.
   const patchById = new Map(updated.map((p) => [p.id, p]));
   const generatedIds = new Set(generated.map((p) => p.id));
   const finalRows = new Map<string, Payment>(
@@ -478,9 +469,7 @@ async function commitWaterfallSingleWrite(args: {
     students:
       remaining > 0
         ? s.students.map((st) =>
-            st.id === studentId
-              ? { ...st, advanceBalance: nextBalance }
-              : st,
+            st.id === studentId ? { ...st, advanceBalance: nextBalance } : st,
           )
         : s.students,
   }));
@@ -508,28 +497,11 @@ async function commitWaterfallSingleWrite(args: {
 }
 
 /**
- * Pure reactive-layer guard for `hydrate*` actions. `onSnapshot` fires on
- * every local Firestore write — including a mirrored echo of our own write —
- * and hands us freshly-mapped arrays. If the mapped contents are identical to
- * what we already hold, we keep the current reference so Zustand does not
- * re-render every subscribed component for a no-op snapshot.
- *
- * Returns the array to store when contents genuinely differ, otherwise
- * `undefined` to signal "keep the current slice as-is". Real remote changes
- * still replace the reference because their mapped contents differ.
- *
- * Element identity is checked by reference first (cheap) and only falls back
- * to a content fingerprint when references differ — necessary because
- * `snapshot.docs.map(d => d.data())` mints fresh objects every time, so a
- * pure reference compare would treat every echo as a change.
- */
-
-/**
- * Normalized JSON fingerprint of a plain record: object keys are sorted
- * recursively and `undefined` properties are dropped (mirroring how
- * Firestore round-trips documents), so a local write and its echo — which
- * may differ in key order or in stripped `undefined` fields — hash to the
- * same string.
+ * Pure reactive-layer guard for `hydrate*` actions. A realtime echo hands us
+ * freshly-mapped arrays on every local write; when the mapped contents are
+ * identical to what we already hold, the current reference is kept so
+ * Zustand does not re-render every subscribed component for a no-op
+ * snapshot. Real remote changes still replace the reference.
  */
 function stableFingerprint(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -654,8 +626,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const prevSessions = get().sessions;
     set((state) => ({ sessions: [...state.sessions, newSession] }));
     // Awaited: attendance_records.session_id is an FK to this row, so the
-    // insert must land before any attendance write against it. Returns null
-    // on failure so the form stays open.
+    // insert must land before any attendance write against it.
     const ok = await persist(
       prevSessions,
       (prev) => set({ sessions: prev }),
@@ -668,9 +639,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   updateSession: async (id, patch) => {
     const prevSessions = get().sessions;
     set((state) => ({
-      sessions: state.sessions.map((s) =>
-        s.id === id ? { ...s, ...patch } : s,
-      ),
+      sessions: state.sessions.map((s) => (s.id === id ? { ...s, ...patch } : s)),
     }));
     return await persist(
       prevSessions,
@@ -707,15 +676,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       if (existing) {
         savedEntry = { ...existing, price: entry.price };
         return {
-          prices: state.prices.map((p) =>
-            p.id === existing.id ? savedEntry! : p,
-          ),
+          prices: state.prices.map((p) => (p.id === existing.id ? savedEntry! : p)),
         };
       }
       savedEntry = { ...entry, id: makeId() };
-      return {
-        prices: [...state.prices, savedEntry],
-      };
+      return { prices: [...state.prices, savedEntry] };
     });
     if (savedEntry) {
       return await persist(
@@ -741,14 +706,17 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   getEffectivePrice: (studentId, subject) => {
     const student = get().students.find((s) => s.id === studentId);
     if (!student) return undefined;
-    const enrollment = student.enrollments.find(
-      (e: SubjectEnrollment) => e.subject === subject,
-    );
+    const enrollment = student.enrollments.find((e) => e.subject === subject);
     if (!enrollment) return undefined;
+    // customPrice wins OUTRIGHT — even when the base PriceEntry row is
+    // missing (an agreed price is an agreed price).
     if (enrollment.customPrice !== undefined) return enrollment.customPrice;
-    // Track and group type now live directly on the enrollment — no
-    // session lookup needed anymore.
-    return get().getBasePrice(student.level, subject, enrollment.track, enrollment.groupType);
+    return get().getBasePrice(
+      student.level,
+      subject,
+      enrollment.track,
+      enrollment.groupType,
+    );
   },
 
   markAttendance: async (studentId, sessionId, date, status, opts) => {
@@ -759,13 +727,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     set((state) => {
       const existing = state.attendanceRecords.find(
         (r) =>
-          r.studentId === studentId &&
-          r.sessionId === sessionId &&
-          r.date === date,
+          r.studentId === studentId && r.sessionId === sessionId && r.date === date,
       );
-      // The auto-absence path must never overwrite an existing record
-      // (in particular, never overwrite a manual Present). Manual clicks
-      // pass isManualOverride to explicitly allow replacing it.
+      // The auto-absence path must never overwrite an existing record (in
+      // particular, never overwrite a manual Present). Manual clicks pass
+      // isManualOverride to explicitly allow replacing it.
       if (existing && !opts?.isManualOverride) {
         return state;
       }
@@ -788,37 +754,37 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           ),
         };
       }
-      return {
-        attendanceRecords: [...state.attendanceRecords, record],
-      };
+      return { attendanceRecords: [...state.attendanceRecords, record] };
     });
-    if (savedRecord) {
-      const ok = await persist(
-        prevAttendance,
-        (prev) => set({ attendanceRecords: prev }),
-        markAttendanceDoc(savedRecord),
-        "attendanceSaveFailed",
-      );
-      // REACTIVE LEDGER: an attendance mark can move the billing anchor, so
-      // re-derive this student+subject's installments once the write lands.
-      // Deferred + failure-isolated: the chip write returns immediately and
-      // a recalc failure never blocks the attendance action itself.
-      if (ok) {
-        const session = get().sessions.find((s) => s.id === sessionId);
-        if (session) {
-          queueMicrotask(() => {
-            void get()
-              .recalculatePaymentsForStudentSubject(studentId, session.subject)
-              .catch((err) => {
-                console.error("[ennajd] reactive ledger recalc failed:", err);
-                toast.warning(t("ledgerRecalcFailed"));
-              });
-          });
-        }
+    if (!savedRecord) return false;
+
+    const ok = await persist(
+      prevAttendance,
+      (prev) => set({ attendanceRecords: prev }),
+      markAttendanceDoc(savedRecord),
+      "attendanceSaveFailed",
+    );
+
+    // REACTIVE LEDGER — UNCONDITIONAL: an attendance mark can move a month's
+    // anchor, so re-derive this student+subject's installments as soon as
+    // the write lands. No hydration gate, no throttle — the empty-ledger
+    // bug was the gate silently aborting this exact path. Deferred +
+    // failure-isolated: the chip write returns immediately and a recalc
+    // failure never blocks the attendance action itself.
+    if (ok) {
+      const session = get().sessions.find((s) => s.id === sessionId);
+      if (session) {
+        queueMicrotask(() => {
+          void get()
+            .recalculatePaymentsForStudentSubject(studentId, session.subject)
+            .catch((err) => {
+              console.error("[ennajd] reactive ledger recalc failed:", err);
+              toast.warning(t("ledgerRecalcFailed"));
+            });
+        });
       }
-      return ok;
     }
-    return false;
+    return ok;
   },
 
   getAttendanceFor: (sessionId, date) => {
@@ -828,15 +794,15 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   },
 
   runAutoAbsenceSweep: async (now) => {
-    // Throttle to once per minute to avoid unnecessary computations
+    // Throttle to once per minute to avoid unnecessary computations.
     const nowMs = now.getTime();
     if (lastAutoAbsenceSweepMs !== null && nowMs - lastAutoAbsenceSweepMs < 60_000) {
       return;
     }
     lastAutoAbsenceSweepMs = nowMs;
 
-    // Idempotent: markAttendance never overwrites an existing record,
-    // so re-running this on every tick is safe and only fills gaps.
+    // Idempotent: markAttendance never overwrites an existing record, so
+    // re-running this on every tick is safe and only fills gaps.
     const state = get();
     const todayKey = formatDateKey(now);
     const dueSessions = state.sessions.filter((session) =>
@@ -846,9 +812,6 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     );
     if (dueSessions.length === 0) return;
 
-    // One index shared by all due sessions: today's records keyed by
-    // student+session, so each existence check is an O(1) lookup instead
-    // of a full scan of the attendance array.
     const existingKeys = new Set(
       state.attendanceRecords
         .filter((r) => r.date === todayKey)
@@ -857,10 +820,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
 
     const newRecords: AttendanceRecord[] = [];
     for (const session of dueSessions) {
-      const enrolledStudentIds = getEnrolledStudentsForSession(
-        state.students,
-        session,
-      ).map((student) => student.id);
+      const enrolledStudentIds = getEnrolledStudentsForSession(state.students, session)
+        .map((student) => student.id);
 
       for (const studentId of enrolledStudentIds) {
         if (!existingKeys.has(`${studentId}__${session.id}`)) {
@@ -882,9 +843,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       set((s) => ({
         attendanceRecords: [...s.attendanceRecords, ...newRecords],
       }));
-      // One batched commit instead of N individual setDoc calls → one
-      // snapshot echo instead of N. Awaited so an offline failure reverts
-      // the local sweep instead of leaving it ahead of the DB.
+      // One batched commit instead of N individual writes → one echo.
       await persist(
         prevAttendance,
         (prev) => set({ attendanceRecords: prev }),
@@ -911,9 +870,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     await persist(
       prevSessions,
       (prev) => set({ sessions: prev }),
-      Promise.all(expired.map((s) => deleteSessionDoc(s.id))).then(() =>
-        undefined,
-      ),
+      Promise.all(expired.map((s) => deleteSessionDoc(s.id))).then(() => undefined),
       "sessionDeleteFailed",
     );
     return expired.length;
@@ -924,36 +881,29 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // hydrated / no students) does not block a later deferred retry.
 
     // NEVER generate before the payments listener has hydrated at least once.
-    // On a fresh page load the local `payments` array is empty (there is no
-    // localStorage cache) while the Firestore snapshot that fills it arrives
-    // asynchronously — later than the `runWhenIdle(syncPayments)` fired on
-    // page mount. Treating that empty array as "no schedule generated yet"
-    // rebuilt the whole schedule with fresh random ids on every load, which is
-    // how one installment multiplied into ~70 identical rows. `hydratePayments`
-    // re-invokes this once the real ledger lands, so bailing here loses nothing.
+    // On a fresh page load the local `payments` array is empty while the
+    // snapshot that fills it arrives asynchronously — later than a
+    // page-mount sync. Treating that empty array as "no schedule generated
+    // yet" rebuilt the whole schedule with fresh ids on every load. The
+    // ATTENDANCE-triggered recalc is NOT gated this way (it rebuilds one
+    // subject and the hydration dedupe collapses any collision); this gate
+    // belongs to the full-ledger generation path only.
     if (!get().hasSyncedPayments) return;
 
-    // Guard after a full console wipe: when students is empty there's nothing
-    // to bill, and we must not re-create orphan payments that the badge would
-    // then intentionally ignore via the studentsById guard.
     const state = get();
     if (state.students.length === 0) return;
 
-    // `force` (the attendance/reactive path) bypasses BOTH throttles so a
-    // re-anchor reacts immediately; every other caller keeps the
-    // once-per-minute + once-per-calendar-day guards.
+    // `force` bypasses BOTH throttles (used only by explicit regenerate
+    // paths); every other caller keeps the once-per-minute +
+    // once-per-calendar-day guards.
     const force = opts?.force === true;
 
-    // Throttle to once per minute to avoid unnecessary computations
     const nowMs = now.getTime();
     if (!force && lastSyncPaymentsMs !== null && nowMs - lastSyncPaymentsMs < 60_000) {
       return;
     }
     lastSyncPaymentsMs = nowMs;
 
-    // Throttled to once per calendar day: the full students × enrollments
-    // scan below only ever produces new rows when a new day/month/
-    // enrollment appears, so re-running it every 30s tick is wasted work.
     const todayKey = formatDateKey(now);
     if (!force && state.lastPaymentsSyncDateKey === todayKey) return;
     set({ lastPaymentsSyncDateKey: todayKey });
@@ -971,16 +921,13 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // UPDATE after the reconcile pass, so they never share an id with the
     // rows in `newPayments` inside the batch upsert.
     const creditPatches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
-    const advanceBalanceUpdates: Array<{
-      studentId: string;
-      nextBalance: number;
-    }> = [];
+    const advanceBalanceUpdates: Array<{ studentId: string; nextBalance: number }> =
+      [];
 
     for (const student of state.students) {
       const prevAdvanceBalance = student.advanceBalance ?? 0;
 
-      // Reuse the shared generator so future installments always exist
-      // before we try to consume advance credit on them.
+      // Generate ONE MONTH AHEAD so wallet surplus has a landing row.
       const generateThrough = new Date(now);
       generateThrough.setMonth(generateThrough.getMonth() + 1);
       const studentGenerated = generateInstallmentsForStudent(
@@ -991,10 +938,9 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         now.toISOString(),
       );
 
-      // CONSUME ADVANCE CREDIT: apply any existing advanceBalance to the
-      // earliest non-fully-paid installments across all subjects, sorted by
-      // dueDate ascending. Surplus that can't be absorbed by newly-generated
-      // installments remains as advanceBalance for next sync.
+      // CONSUME ADVANCE CREDIT: apply the wallet to the earliest
+      // non-fully-paid installments across all subjects, dueDate ascending.
+      // Surplus that can't be absorbed remains as advanceBalance.
       if (prevAdvanceBalance > 0) {
         const allStudentPayments = [
           ...state.payments.filter((p) => p.studentId === student.id),
@@ -1003,7 +949,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         const { updated, remaining } = applyCreditWaterfall(
           allStudentPayments,
           student.id,
-          null,
+          null, // cross-subject
           prevAdvanceBalance,
           todayKey,
           now.toISOString(),
@@ -1013,40 +959,26 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
           // Apply the credit IN PLACE, never by appending: a patched row is
           // either an EXISTING ledger row or one of the generated rows about
           // to be appended. Appending full copies duplicates ids, which both
-          // breaks the one-row-per-month invariant (the red panel then sums
-          // the stale and the credited copy) and puts two rows sharing a
-          // primary key in the batch upsert — PostgREST rejects that with
+          // breaks the one-row-per-month invariant and puts two rows sharing
+          // a primary key in the batch upsert — PostgREST rejects that with
           // "cannot affect row a second time", rolling back the WHOLE commit
-          // and stranding the carryover in the wallet (Oct then re-shows its
-          // full amount in red, ignoring the credit).
+          // and stranding the carryover in the wallet.
           const patchById = new Map(updated.map((p) => [p.id, p]));
           set((s) => ({
             payments: s.payments.map((p) => patchById.get(p.id) ?? p),
             students: s.students.map((s2) =>
-              s2.id === student.id
-                ? { ...s2, advanceBalance: remaining }
-                : s2,
+              s2.id === student.id ? { ...s2, advanceBalance: remaining } : s2,
             ),
           }));
-          // The generated rows ride along in newPayments — carry their patch
-          // onto the copy that actually gets appended + upserted.
           for (let i = 0; i < studentGenerated.length; i++) {
             const patched = patchById.get(studentGenerated[i].id);
             if (patched) studentGenerated[i] = patched;
           }
-          // Persist the credit on EXISTING rows via per-id UPDATE (same path
-          // recordPartialPayment uses) — the batch upsert would duplicate
-          // their ids. Generated rows are persisted through newPayments.
           const generatedIds = new Set(studentGenerated.map((p) => p.id));
           for (const u of updated) {
             if (!generatedIds.has(u.id)) creditPatches.push(u);
           }
-          // Collect for persistence — the missing write that used to lose
-          // carried-forward credit on refresh.
-          advanceBalanceUpdates.push({
-            studentId: student.id,
-            nextBalance: remaining,
-          });
+          advanceBalanceUpdates.push({ studentId: student.id, nextBalance: remaining });
         }
       }
 
@@ -1055,13 +987,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
 
     // SELF-HEAL: make the Rule A ledger AUTHORITATIVE. Beyond patching rows
     // whose amount drifted (price/timetable edits, engine migration), this
-    // also deletes Rule A rows the engine would no longer emit at all — a
-    // removed timetable/enrollment/price, a gap month, or a month predating
-    // enrollment. Those stale rows are what kept showing an old full-price
-    // month on the board after the rewrite. Rule B rows are never touched;
-    // a patched row keeps its amountPaid and stays paid only when that paid
-    // amount covers the NEW amountDue. Reads the CURRENT ledger so the
-    // advance-credit patches applied in the loop above survive the rebuild.
+    // also deletes Rule A rows the engine would no longer emit at all.
+    // Rule B rows are never touched.
     const currentPayments = get().payments;
     const reconcile = reconcileRuleALedger(
       currentPayments,
@@ -1071,9 +998,6 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       get().attendanceRecords,
       todayKey,
     );
-    // Rebuilt rows for the DB upsert — kept OUT of `newPayments` so they
-    // are never appended twice to the local ledger (they are applied
-    // in place by the map below).
     const reconciledPayments: Payment[] = [];
     const deletedPaymentIds: string[] = reconcile.delete;
 
@@ -1124,15 +1048,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
 
     set((s) => ({ payments: [...s.payments, ...newPayments] }));
-    // Generated installments + advanceBalance consumptions are ONE logical
-    // change: commit both, or revert both slices together so the local store
-    // never diverges from the DB.
     try {
       // DELETE BEFORE UPSERT: collapsing a month can RE-DATE the surviving
       // row onto a `due_date` a surplus row still occupies. Deleting the
       // surplus first keeps the unique(student_id, subject, due_date)
-      // constraint satisfiable — upserting first would trip it and the
-      // whole batch would roll back.
+      // constraint satisfiable.
       if (deletedPaymentIds.length > 0) {
         await deletePaymentsBatchDoc(deletedPaymentIds);
       }
@@ -1140,14 +1060,10 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       if (upsertRows.length > 0) {
         await upsertPaymentsBatchDoc(upsertRows);
       }
-      // Credit applied to existing rows by the advance-consumption pass —
-      // patched per-id so it never collides with the upsert batch above.
       if (creditPatches.length > 0) {
         await updatePaymentsBatchDoc(creditPatches);
       }
       for (const { studentId, nextBalance } of advanceBalanceUpdates) {
-        // The missing write that used to lose carried-forward credit on
-        // refresh — the balance is only local until this lands.
         await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
       }
     } catch (err) {
@@ -1158,39 +1074,35 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
 
   /**
    * REACTIVE LEDGER — re-derives ONE student+subject's Rule A installments
-   * from the attendance anchor (earliest valid attendance date, enrollment
-   * fallback) and redistributes that subject's paid credit earliest-first
-   * across the following months. Triggered (deferred) by every attendance
-   * write, so the Payments page ledger follows attendance marks without a
-   * reload. Rule B (2Bac s.x Small) is untouched.
+   * from the per-month attendance anchors (earliest PRESENT attendance of
+   * each month, enrollment fallback) and redistributes the subject's paid
+   * credit PLUS the carried wallet earliest-first across the rebuilt months.
    *
-   * A forced `syncPayments` runs first — the attendance path's throttle
-   * bypass — so the rest of the student's ledger is current (future
-   * installments exist, advance credit consumed) before the targeted
-   * rebuild. Both passes are idempotent, so repeated triggers are safe.
-   * Failures revert + warn and never block the attendance write.
+   * FIRES UNCONDITIONALLY from markAttendance: no `hasSyncedPayments` gate
+   * (that silent bail is what left the ledger empty forever) and no throttle.
+   * The engine generates through now + 1 month so wallet surplus always has
+   * a landing row.
+   *
+   * SINGLE WRITE: the rebuilt rows ALREADY carry their waterfall credit, so
+   * exactly ONE `upsertPaymentsBatchDoc` commits the whole recalc — its
+   * realtime echo can only re-deliver content the store already holds, which
+   * is what stops a credited month flipping green→red on refresh. Stale
+   * months are deleted BEFORE the upsert (unique-constraint safe), and
+   * unabsorbed surplus lands in `advanceBalance` via ONE students-table
+   * write (separate realtime channel). Rule B (every 2Bac Small combo) is a
+   * no-op. Failures revert + warn and never block the attendance write.
    */
   recalculatePaymentsForStudentSubject: async (studentId, subject) => {
-    // Never run before the ledger has hydrated — an empty local `payments`
-    // array would make the rebuild mint fresh ids for rows that still exist
-    // remotely (the same dedupe hazard `syncPayments` guards against).
-    if (!get().hasSyncedPayments) return;
-
     const student = get().students.find((s) => s.id === studentId);
     if (!student) return;
 
     const now = new Date();
     const asOfKey = formatDateKey(now);
-    // Same horizon as `syncPayments` (now + 1 month) so the credit cascade
-    // has future installments to land on.
+    // One month ahead — surplus needs a landing row.
     const asOf = new Date(now);
     asOf.setMonth(asOf.getMonth() + 1);
+    const updatedAt = now.toISOString();
 
-    // The attendance path's forced sync — bypasses the daily throttle,
-    // leaving every other caller's guard untouched.
-    await get().syncPayments(now, { force: true });
-
-    // Re-read after the sync so the rebuild sees the current ledger.
     const state = get();
     const current = state.students.find((s) => s.id === studentId);
     if (!current) return;
@@ -1202,63 +1114,69 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       prices: state.prices,
       asOf,
       asOfKey,
-      updatedAt: now.toISOString(),
+      updatedAt,
     });
 
+    // DB constraint guards: one row per (student, subject, month) and every
+    // amountDue strictly positive (check (amount_due > 0)).
+    const byMonth = new Map<string, Payment>();
+    for (const row of result.toUpsert) {
+      if (row.amountDue <= 0) continue;
+      const key = `${row.studentId}__${row.subject}__${row.month}`;
+      const dup = byMonth.get(key);
+      if (!dup || isMoreSettledPayment(row, dup)) byMonth.set(key, row);
+    }
+    const rows = [...byMonth.values()];
+
+    // The rebuild's credit pool already included the carried wallet, so the
+    // new wallet is exactly the unabsorbed remainder.
+    const prevBalance = current.advanceBalance ?? 0;
+    const nextBalance = Math.max(0, Math.round(result.remainingCredit));
+    const walletChanged = nextBalance !== prevBalance;
+
     if (
+      rows.length === 0 &&
       result.toDelete.length === 0 &&
-      result.toUpsert.length === 0 &&
-      result.remainingCredit === 0
+      !walletChanged
     ) {
       return;
     }
 
     const previousPayments = state.payments;
     const previousStudents = state.students;
-    const upsertById = new Map(result.toUpsert.map((p) => [p.id, p]));
+    const upsertById = new Map(rows.map((p) => [p.id, p]));
     const deleteSet = new Set(result.toDelete);
-    let nextAdvanceBalance: number | undefined;
 
-    // Apply the diff in place: drop non-billable months, patch changed rows,
-    // append genuinely-new ones.
+    // Apply the diff IN MEMORY: drop non-billable months, patch changed
+    // rows, append genuinely-new ones, park the surplus.
     set((s) => {
       const existingIds = new Set(s.payments.map((p) => p.id));
-      const appended = result.toUpsert.filter((p) => !existingIds.has(p.id));
+      const appended = rows.filter((p) => !existingIds.has(p.id));
       return {
         payments: s.payments
           .filter((p) => !deleteSet.has(p.id))
           .map((p) => upsertById.get(p.id) ?? p)
           .concat(appended),
+        students: walletChanged
+          ? s.students.map((st) =>
+              st.id === studentId ? { ...st, advanceBalance: nextBalance } : st,
+            )
+          : s.students,
       };
     });
 
-    // Credit the rebuilt installments could not absorb → carried forward.
-    if (result.remainingCredit > 0) {
-      const prevBalance =
-        get().students.find((s) => s.id === studentId)?.advanceBalance ?? 0;
-      nextAdvanceBalance = prevBalance + result.remainingCredit;
-      set((s) => ({
-        students: s.students.map((st) =>
-          st.id === studentId
-            ? { ...st, advanceBalance: nextAdvanceBalance as number }
-            : st,
-        ),
-      }));
-    }
-
     try {
       // DELETE BEFORE UPSERT: a re-anchor can move a row's dueDate onto a
-      // date a stale row still occupies. Deleting first keeps the
-      // unique(student_id, subject, due_date) constraint satisfiable —
-      // upserting first would trip it and the whole batch would roll back.
+      // date a stale row still occupies — deleting first keeps the
+      // unique(student_id, subject, due_date) constraint satisfiable.
       if (result.toDelete.length > 0) {
         await deletePaymentsBatchDoc(result.toDelete);
       }
-      if (result.toUpsert.length > 0) {
-        await upsertPaymentsBatchDoc(result.toUpsert);
+      if (rows.length > 0) {
+        await upsertPaymentsBatchDoc(rows);
       }
-      if (nextAdvanceBalance !== undefined) {
-        await updateStudentAdvanceBalanceDoc(studentId, nextAdvanceBalance);
+      if (walletChanged) {
+        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
       }
     } catch (err) {
       console.error("[ennajd] reactive ledger recalc write failed:", err);
@@ -1273,7 +1191,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
 
     // Confirm only when an installment actually moved.
-    if (result.toDelete.length > 0 || result.toUpsert.length > 0) {
+    if (rows.length > 0 || result.toDelete.length > 0) {
       const name = `${current.firstName} ${current.lastName}`;
       toast.success(t("ledgerRecalculated").replace("{student}", name));
     }
@@ -1301,22 +1219,19 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const updatedAt = new Date().toISOString();
     const state = get();
 
-    // Snapshot BOTH payments AND students (for advanceBalance revert) before
-    // the optimistic update, per the rollback-on-failure contract.
+    // Snapshot BOTH payments AND students (for advanceBalance revert).
     const previousPayments = state.payments;
     const previousStudents = state.students;
     const student = previousStudents.find((s) => s.id === studentId);
     if (!student) return;
 
     // Ensure future installments exist for THIS student+subject before
-    // applying the waterfall, so surplus has somewhere to land. Generate
-    // one extra month beyond asOf so a partial can reach a future invoice.
+    // applying the waterfall, so surplus has somewhere to land.
     const existingKeys = new Set(
       previousPayments
         .filter((p) => p.studentId === studentId && p.subject === subject)
         .map((p) => `${p.studentId}__${p.subject}__${p.rule}__${p.month}`),
     );
-    // Generate one month ahead so the surplus can land on next month's bill.
     const generateThrough = new Date(asOf);
     generateThrough.setMonth(generateThrough.getMonth() + 2);
     const futureInstallments = generateInstallmentsForStudent(
@@ -1326,16 +1241,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       existingKeys,
       updatedAt,
     );
-    // Filter to just the target subject (generateInstallmentsForStudent is
-    // cross-subject for applyInitialTuitionPayment, but here we need per-subject).
-    const filteredGenerated = futureInstallments.filter(
-      (p) => p.subject === subject,
-    );
+    const filteredGenerated = futureInstallments.filter((p) => p.subject === subject);
 
-    // Single-write waterfall: the credit is merged onto the final rows fully
-    // in memory and committed in ONE upsert, so the realtime echo can only
-    // ever re-deliver the waterfalled state — never a pre-credit snapshot
-    // that flips a credited month back to red.
     await commitWaterfallSingleWrite({
       studentId,
       subject,
@@ -1348,143 +1255,121 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     });
   },
 
-/**
- * Pencil dialog action — lands the student+subject's DUE remaining exactly
- * on `targetRemaining`, without ever touching strictly-future auto-generated
- * installments (Reste guard: dueDate <= asOf only). The target is clamped to
- * [0, Σ amountDue of due installments].
- *
- * "Remaining" follows the app-wide semantics: an installment counts as owed
- * only when it is NOT fully paid (neither `isPaid` flag nor amountPaid
- * covering amountDue) — identical to getDueBalanceForStudentSubject /
- * aggregateOverdueInstallments, so the Impayés/Payés panels, bell and PDFs
- * all agree.
- *
- * Down (target < current): credit spread earliest-first across due unpaid
- * installments — the same waterfall as recordPartialPayment.
- * Up (target > current): covered due installments are un-settled LATEST-first
- * (flag first, then paid credit), optionally retaining partial credit, to
- * land exactly on the target. All patches ship in ONE batch commit.
- */
-adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) => {
-  if (!Number.isFinite(targetRemaining) || targetRemaining < 0) return;
-  const asOfKey = formatDateKey(asOf);
-  const updatedAt = new Date().toISOString();
+  /**
+   * Pencil dialog action — lands the student+subject's DUE remaining exactly
+   * on `targetRemaining`, without ever touching strictly-future
+   * auto-generated installments (Reste guard: dueDate <= asOf only). The
+   * target is clamped to [0, Σ amountDue of due installments].
+   *
+   * Down (target < current): credit spread earliest-first across due unpaid
+   * installments. Up (target > current): covered due installments are
+   * un-settled LATEST-first (flag first, then paid credit) to land exactly on
+   * the target. All patches ship in ONE batch commit.
+   */
+  adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) => {
+    if (!Number.isFinite(targetRemaining) || targetRemaining < 0) return;
+    const asOfKey = formatDateKey(asOf);
+    const updatedAt = new Date().toISOString();
 
-  const isSettled = (p: Payment) =>
-    p.isPaid || (p.amountPaid ?? 0) >= p.amountDue;
-  const remainingOf = (p: Payment) =>
-    Math.max(0, p.amountDue - (p.amountPaid ?? 0));
+    const isSettled = (p: Payment) =>
+      p.isPaid || (p.amountPaid ?? 0) >= p.amountDue;
+    const remainingOf = (p: Payment) =>
+      Math.max(0, p.amountDue - (p.amountPaid ?? 0));
 
-  // Every installment due as of `asOf` (paid or not), dueDate ascending.
-  const duePayments = get()
-    .payments.filter(
-      (p) => p.studentId === studentId && p.subject === subject && p.dueDate <= asOfKey,
-    )
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    const duePayments = get()
+      .payments.filter(
+        (p) =>
+          p.studentId === studentId && p.subject === subject && p.dueDate <= asOfKey,
+      )
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
-  const totalDueAmount = duePayments.reduce((sum, p) => sum + p.amountDue, 0);
-  const currentRemaining = duePayments.reduce(
-    (sum, p) => sum + (isSettled(p) ? 0 : remainingOf(p)),
-    0,
-  );
-  const target = Math.min(Math.round(targetRemaining), totalDueAmount);
+    const totalDueAmount = duePayments.reduce((sum, p) => sum + p.amountDue, 0);
+    const currentRemaining = duePayments.reduce(
+      (sum, p) => sum + (isSettled(p) ? 0 : remainingOf(p)),
+      0,
+    );
+    const target = Math.min(Math.round(targetRemaining), totalDueAmount);
 
-  if (target === currentRemaining) return;
+    if (target === currentRemaining) return;
 
-  const nextPayments: Payment[] = [];
-  const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
+    const nextPayments: Payment[] = [];
+    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [];
 
-  const applyPatch = (payment: Payment, amountPaid: number, isPaid: boolean) => {
-    nextPayments.push({ ...payment, amountPaid, isPaid, updatedAt });
-    patches.push({ id: payment.id, amountPaid, isPaid, updatedAt });
-  };
+    const applyPatch = (payment: Payment, amountPaid: number, isPaid: boolean) => {
+      nextPayments.push({ ...payment, amountPaid, isPaid, updatedAt });
+      patches.push({ id: payment.id, amountPaid, isPaid, updatedAt });
+    };
 
-  if (target < currentRemaining) {
-    // Credit waterfall, earliest-first (same spread as recordPartialPayment).
-    let credit = currentRemaining - target;
-    for (const payment of duePayments) {
-      if (credit <= 0) break;
-      if (isSettled(payment)) continue;
-      const remaining = remainingOf(payment);
-      if (remaining <= 0) continue;
-      const apply = Math.min(remaining, credit);
-      const amountPaid = (payment.amountPaid ?? 0) + apply;
-      applyPatch(payment, amountPaid, amountPaid >= payment.amountDue);
-      credit -= apply;
+    if (target < currentRemaining) {
+      // Credit waterfall, earliest-first.
+      let credit = currentRemaining - target;
+      for (const payment of duePayments) {
+        if (credit <= 0) break;
+        if (isSettled(payment)) continue;
+        const remaining = remainingOf(payment);
+        if (remaining <= 0) continue;
+        const apply = Math.min(remaining, credit);
+        const amountPaid = (payment.amountPaid ?? 0) + apply;
+        applyPatch(payment, amountPaid, amountPaid >= payment.amountDue);
+        credit -= apply;
+      }
+    } else {
+      // Undo walk, LATEST-first.
+      let toRaise = target - currentRemaining;
+      for (let i = duePayments.length - 1; i >= 0 && toRaise > 0; i--) {
+        const payment = duePayments[i];
+        const settled = isSettled(payment);
+        const paid = payment.amountPaid ?? 0;
+        const capacity = settled ? payment.amountDue : paid;
+        if (capacity <= 0) continue;
+
+        const raise = Math.min(capacity, toRaise);
+        const nextPaid = settled ? payment.amountDue - raise : paid - raise;
+        applyPatch(payment, nextPaid, false);
+        toRaise -= raise;
+      }
     }
-  } else {
-    // Undo walk, LATEST-first. A settled row can raise its remaining from 0
-    // up to amountDue by converting to partial credit (isPaid → false +
-    // amountPaid = amountDue − raise), exactly as the plan specifies. An
-    // unsettled partial row can only shed its existing paid credit.
-    let toRaise = target - currentRemaining;
-    for (let i = duePayments.length - 1; i >= 0 && toRaise > 0; i--) {
-      const payment = duePayments[i];
-      const settled = isSettled(payment);
-      const paid = payment.amountPaid ?? 0;
-      const capacity = settled ? payment.amountDue : paid;
-      if (capacity <= 0) continue;
 
-      const raise = Math.min(capacity, toRaise);
-      const nextPaid = settled ? payment.amountDue - raise : paid - raise;
-      applyPatch(payment, nextPaid, false);
-      toRaise -= raise;
+    if (patches.length === 0) return;
+
+    const nextById = new Map(nextPayments.map((p) => [p.id, p]));
+    const previous = get().payments;
+    set((state) => ({
+      payments: state.payments.map((p) => nextById.get(p.id) ?? p),
+    }));
+    try {
+      await updatePaymentsBatchDoc(patches);
+    } catch (err) {
+      set({ payments: previous });
+      toast.error(t("paymentSaveFailed"));
     }
-  }
+  },
 
-  if (patches.length === 0) return;
-
-  const nextById = new Map(nextPayments.map((p) => [p.id, p]));
-  const previous = get().payments;
-  set((state) => ({
-    payments: state.payments.map((p) => nextById.get(p.id) ?? p),
-  }));
-  try {
-    await updatePaymentsBatchDoc(patches);
-  } catch (err) {
-    set({ payments: previous });
-    toast.error(t("paymentSaveFailed"));
-  }
-},
-
-/**
- * Create-time tuition payment — called by `StudentFormSheet` right after a new
- * student is created. Distributes `totalPaid` across ALL of the student's
- * subjects in a single earliest-due-first waterfall (same ordering as
- * `recordPartialPayment`: dueDate then subject locale), only crediting
- * installments that are already due (dueDate <= asOfKey — the Reste guard),
- * never future auto-generated months.
- *
- * This is a cross-subject generalization of `recordPartialPayment`: instead
- * of filtering to one subject, it scans every subject of the student, so a
- * single credit can spill from a Math installment into a PC installment when
- * the first subject's due installments are exhausted. Surplus that can't be
- * absorbed by any installment is stored as `advanceBalance` on the student.
- *
- * Optimistic local update (snapshot + rollback on failure), then a single
- * `updatePaymentsBatchDoc` commit. On failure the caller (StudentFormSheet)
- * stays open; the error toast is fired here and the local snapshot reverted.
- */
+  /**
+   * Create-time tuition payment — called by `StudentFormSheet` right after a
+   * new student is created. Distributes `totalPaid` across ALL of the
+   * student's subjects in a single earliest-due-first waterfall (dueDate
+   * then subject), only crediting installments with a remaining gap. Surplus
+   * that can't be absorbed is stored as `advanceBalance`. Commits through
+   * the shared single-write helper, so a Supabase rejection rethrows (the
+   * caller stays open) and both slices roll back.
+   */
   applyInitialTuitionPayment: async (studentId, totalPaid, asOf) => {
     const asOfKey = formatDateKey(asOf);
     const updatedAt = new Date().toISOString();
 
     if (!Number.isFinite(totalPaid) || totalPaid <= 0) return;
 
-    // Snapshot BOTH payments AND students (for advanceBalance revert) before
-    // the optimistic update, per the rollback-on-failure contract.
     const previousPayments = get().payments;
     const previousStudents = get().students;
     const student = previousStudents.find((s) => s.id === studentId);
     if (!student) return;
 
     // Ensure installments exist for this student before distributing credit.
-    // `syncPayments` is throttled to once/day + once/min and may not have run
-    // yet for the just-created student (the realtime echo is async). Generate
-    // inline for this student only — `syncPayments`' `existingKeys` dedupe
-    // means these rows are skipped on the next full sync, and `hydratePayments`
-    // + `dedupePayments` collapse any realtime duplicates.
+    // `syncPayments` is throttled and may not have run for the just-created
+    // student yet; the existingKeys dedupe means these rows are skipped on
+    // the next full sync, and `hydratePayments` + `dedupePayments` collapse
+    // any realtime duplicates.
     const existingKeys = new Set(
       previousPayments
         .filter((p) => p.studentId === studentId)
@@ -1500,12 +1385,6 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
       updatedAt,
     );
 
-    // Single-write cross-subject waterfall: the credit is merged onto the
-    // final rows fully in memory and committed in ONE upsert, so the realtime
-    // echo can only re-deliver the waterfalled state. The old early
-    // `if (!anyChanged) return` is gone — the helper's own empty-payload guard
-    // replaces it, and unabsorbed surplus now always reaches advanceBalance
-    // instead of being silently dropped when every installment was paid.
     await commitWaterfallSingleWrite({
       studentId,
       subject: null, // cross-subject
@@ -1521,17 +1400,9 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
 
   /**
    * Manual "recalculate installments" action — deletes every Rule A row and
-   * rebuilds it from scratch with the session-based engine, keeping Rule B
-   * rows untouched. Used to settle old balances immediately after a price or
-   * timetable change, without waiting for the daily `syncPayments` self-heal.
-   *
-   * Payment progress is preserved per (student, subject, month): the amount
-   * already paid on the deleted rows of that month is carried onto the
-   * rebuilt row (capped at the new amountDue), and `isPaid` is recomputed
-   * strictly from that paid amount.
-   *
-   * Optimistic local update (snapshot + rollback on failure). Callers ask
-   * the user to confirm first — the whole Rule A ledger is rewritten.
+   * rebuilds it from scratch, keeping Rule B rows untouched. Payment progress
+   * is preserved per (student, subject, month). Callers ask the user to
+   * confirm first — the whole Rule A ledger is rewritten.
    */
   regeneratePaymentLedger: async () => {
     if (!get().hasSyncedPayments) return false;
@@ -1539,7 +1410,6 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     const previousPayments = get().payments;
     const previousStudents = get().students;
 
-    // Keep every Rule B row; the Rule A rows are fully rebuilt.
     const keptPayments = previousPayments.filter((p) => p.rule !== "A");
     const deletedRuleA = previousPayments.filter((p) => p.rule === "A");
 
@@ -1570,25 +1440,25 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
         updatedAt,
       );
       for (const payment of generated) {
-        // Only genuinely-missing rows are generated (existingKeys dedupes the
-        // kept Rule B rows). Restore the prior payment progress for that month.
         const paidKey = `${payment.studentId}__${payment.subject}__${payment.month}`;
         const carriedPaid = Math.min(paidByMonth.get(paidKey) ?? 0, payment.amountDue);
         rebuilt.push(
           carriedPaid > 0
-            ? { ...payment, amountPaid: carriedPaid, isPaid: carriedPaid >= payment.amountDue }
+            ? {
+                ...payment,
+                amountPaid: carriedPaid,
+                isPaid: carriedPaid >= payment.amountDue,
+              }
             : payment,
         );
       }
     }
 
     // Guard the DB constraints before writing:
-    //  - unique(student_id, subject, due_date): the ledger keeps exactly ONE
-    //    row per (rule, month) — a dueDate determines its month, so
-    //    collapsing by rule + month also removes every dueDate collision.
-    //    Keep the most settled row.
-    //  - check (amount_due > 0): a zero/negative amount (free join month,
-    //    zero price) must never be inserted.
+    //  - unique(student_id, subject, due_date): exactly ONE row per
+    //    (rule, month) — a dueDate determines its month, so collapsing by
+    //    rule + month removes every dueDate collision (keep the most settled).
+    //  - check (amount_due > 0): a zero/negative amount must never ship.
     const deduped = new Map<string, Payment>();
     for (const payment of rebuilt) {
       if (payment.amountDue <= 0) continue;
@@ -1608,8 +1478,7 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
 
     try {
       // DELETE BEFORE UPSERT: the rebuilt rows reuse the natural key of the
-      // deleted ones, so the Rule A rows must be gone before the inserts
-      // land or the unique constraint rejects the batch.
+      // deleted ones, so the Rule A rows must be gone before the inserts land.
       if (deletedRuleA.length > 0) {
         await deletePaymentsBatchDoc(deletedRuleA.map((p) => p.id));
       }
@@ -1624,107 +1493,89 @@ adjustStudentSubjectBalance: async (studentId, subject, targetRemaining, asOf) =
     }
   },
 
-/**
- * Pencil dialog action — writes/clears the free-text `paymentNote` on the
- * student's enrollment for that subject, reusing `updateStudent`'s
- * enrolledAt-stamping logic so billing history is never disturbed.
- */
-setSubjectPaymentNote: (studentId, subject, note) => {
-  const student = get().students.find((s) => s.id === studentId);
-  if (!student) return;
-  const enrollment = student.enrollments.find((e) => e.subject === subject);
-  if (!enrollment) return;
+  /**
+   * Pencil dialog action — writes/clears the free-text `paymentNote` on the
+   * student's enrollment for that subject, reusing `updateStudent`'s
+   * enrolledAt-stamping logic so billing history is never disturbed.
+   */
+  setSubjectPaymentNote: (studentId, subject, note) => {
+    const student = get().students.find((s) => s.id === studentId);
+    if (!student) return;
+    const enrollment = student.enrollments.find((e) => e.subject === subject);
+    if (!enrollment) return;
 
-  const trimmed = note?.trim();
-  const nextNote = trimmed ? trimmed : undefined;
-  if ((enrollment.paymentNote ?? undefined) === nextNote) return;
+    const trimmed = note?.trim();
+    const nextNote = trimmed ? trimmed : undefined;
+    if ((enrollment.paymentNote ?? undefined) === nextNote) return;
 
-  get().updateStudent(studentId, {
-    enrollments: student.enrollments.map((e) =>
-      e.subject === subject ? { ...e, paymentNote: nextNote } : e,
-    ),
-  });
-},
+    get().updateStudent(studentId, {
+      enrollments: student.enrollments.map((e) =>
+        e.subject === subject ? { ...e, paymentNote: nextNote } : e,
+      ),
+    });
+  },
 
-/**
- * Registration fee (رسوم التسجيل) — one-time 100 DH, completely separate
- * from the Rule A/B installment engine (never flows into installment
- * totals). Merges the patch over the existing fee (or the legacy default
- * {due: 100, paid: 0} for students with no stored field), clamps paid to
- * [0, due], stamps settledAt on full payment (kept when re-settling,
- * cleared when dropping back to partial), and stamps updatedAt.
- *
- * The dialog always sends explicit amountDue + amountPaid, so a note-only
- * save on a legacy student can never accidentally flip them to unpaid —
- * the effective remaining is initialized to 0 (paid) in the dialog.
- */
-updateRegistrationFee: (studentId, patch) => {
-  const student = get().students.find((s) => s.id === studentId);
-  if (!student) return;
+  /**
+   * Registration fee (رسوم التسجيل) — one-time 100 DH, completely separate
+   * from the Rule A/B installment engine. Merges the patch over the existing
+   * fee (or the legacy default {due: 100, paid: 0}), clamps paid to [0, due],
+   * stamps settledAt on full payment, and writes only when something changed.
+   */
+  updateRegistrationFee: (studentId, patch) => {
+    const student = get().students.find((s) => s.id === studentId);
+    if (!student) return;
 
-  const existing: RegistrationFee =
-    student.registrationFee ??
-    ({ amountDue: REGISTRATION_FEE_DEFAULT, amountPaid: 0 } as RegistrationFee);
-  const isLegacy = !student.registrationFee;
+    const existing: RegistrationFee =
+      student.registrationFee ??
+      ({ amountDue: REGISTRATION_FEE_DEFAULT, amountPaid: 0 } as RegistrationFee);
+    const isLegacy = !student.registrationFee;
 
-  const amountDue = Math.max(0, patch.amountDue ?? existing.amountDue);
-  const amountPaid = Math.min(
-    amountDue,
-    Math.max(0, patch.amountPaid ?? existing.amountPaid),
-  );
-  // Note handling: an explicit patch.note always wins (empty string clears);
-  // otherwise the existing note is preserved untouched — a partial-payment
-  // save never wipes a saved note.
-  const nextNote: string | undefined =
-    patch.note !== undefined
-      ? patch.note.trim() || undefined
-      : existing.note;
+    const amountDue = Math.max(0, patch.amountDue ?? existing.amountDue);
+    const amountPaid = Math.min(
+      amountDue,
+      Math.max(0, patch.amountPaid ?? existing.amountPaid),
+    );
+    const nextNote: string | undefined =
+      patch.note !== undefined ? patch.note.trim() || undefined : existing.note;
 
-  const next: RegistrationFee = {
-    ...existing,
-    amountDue,
-    amountPaid,
-    note: nextNote,
-  };
+    const next: RegistrationFee = {
+      ...existing,
+      amountDue,
+      amountPaid,
+      note: nextNote,
+    };
 
-  // settledAt transitions: set/kept when fully paid, cleared when partial.
-  if (amountDue - amountPaid <= 0) {
-    next.settledAt = existing.settledAt ?? new Date().toISOString();
-  } else {
-    next.settledAt = undefined;
-  }
-  next.updatedAt = new Date().toISOString();
+    if (amountDue - amountPaid <= 0) {
+      next.settledAt = existing.settledAt ?? new Date().toISOString();
+    } else {
+      next.settledAt = undefined;
+    }
+    next.updatedAt = new Date().toISOString();
 
-  // No-op guard: single write only when something actually changed. A legacy
-  // student (no stored fee) always counts as changed — materializing the
-  // field is itself a write (e.g. marking a legacy non-payer via the dialog).
-  if (
-    !isLegacy &&
-    existing.amountDue === next.amountDue &&
-    existing.amountPaid === next.amountPaid &&
-    (existing.note ?? undefined) === nextNote &&
-    existing.settledAt === next.settledAt
-  ) {
-    return;
-  }
+    if (
+      !isLegacy &&
+      existing.amountDue === next.amountDue &&
+      existing.amountPaid === next.amountPaid &&
+      (existing.note ?? undefined) === nextNote &&
+      existing.settledAt === next.settledAt
+    ) {
+      return;
+    }
 
-  get().updateStudent(studentId, { registrationFee: next });
-},
+    get().updateStudent(studentId, { registrationFee: next });
+  },
 
-/**
- * One-click Settle (panel/wallet/bell rows): pays the fee in full —
- * `amountPaid = existing?.amountDue ?? 100`. Toast is handled by callers.
- */
-settleRegistrationFee: (studentId) => {
-  const student = get().students.find((s) => s.id === studentId);
-  if (!student) return;
-  get().updateRegistrationFee(studentId, {
-    amountPaid: student.registrationFee?.amountDue ?? REGISTRATION_FEE_DEFAULT,
-  });
-},
+  /** One-click Settle (panel/wallet/bell rows): pays the fee in full. */
+  settleRegistrationFee: (studentId) => {
+    const student = get().students.find((s) => s.id === studentId);
+    if (!student) return;
+    get().updateRegistrationFee(studentId, {
+      amountPaid: student.registrationFee?.amountDue ?? REGISTRATION_FEE_DEFAULT,
+    });
+  },
 
-getOutstandingInstallment: (studentId, subject, asOf) => {
-  const asOfKey = formatDateKey(asOf);
+  getOutstandingInstallment: (studentId, subject, asOf) => {
+    const asOfKey = formatDateKey(asOf);
     const candidates = get().payments.filter(
       (p) =>
         p.studentId === studentId &&
@@ -1798,7 +1649,7 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
   hydrateStudents: (students) => {
     // Materialize advanceBalance (default 0) for legacy students who predate
     // the `advance_balance` column — prevents undefined/NaN in downstream
-    // arithmetic (syncPayments, StudentTable Reste).
+    // arithmetic.
     const normalized = students.map((s) =>
       s.advanceBalance === undefined ? { ...s, advanceBalance: 0 } : s,
     );
@@ -1827,10 +1678,7 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
   },
   hydratePayments: (payments) => {
     // Self-heal: collapse duplicate rows that share a logical installment
-    // identity (`studentId__subject__month`) — leftovers from loads that
-    // generated before hydration, or a re-anchor's re-dated duplicate — and
-    // delete the surplus docs from Firestore. Idempotent: a clean ledger is
-    // returned untouched and this schedules no writes.
+    // identity (`studentId__subject__month`) and delete the surplus docs.
     const { kept, duplicateIds } = dedupePayments(payments);
     if (duplicateIds.length > 0) void deletePaymentsBatchDoc(duplicateIds);
 
@@ -1845,19 +1693,17 @@ getOutstandingInstallment: (studentId, subject, asOf) => {
     // off now that the real ledger is in place.
     maybeRunPaymentSync();
   },
-    hydrateMessages: (messages) => {
-      const next = replaceIfChanged(get().messages, messages);
-      if (next) set({ messages: next });
-    },
-  }));
+  hydrateMessages: (messages) => {
+    const next = replaceIfChanged(get().messages, messages);
+    if (next) set({ messages: next });
+  },
+}));
 
 /**
  * Fills any missing installments as soon as BOTH the authoritative ledger
  * (`hasSyncedPayments`) and the student roster are present — regardless of
- * which route mounted first, and without ever generating against an
- * un-hydrated (empty) ledger. Called from the hydrate actions above.
- * `syncPayments` self-guards and self-throttles, so this is a cheap no-op
- * whenever there is nothing to generate.
+ * which route mounted first. `syncPayments` self-guards and self-throttles,
+ * so this is a cheap no-op whenever there is nothing to generate.
  */
 function maybeRunPaymentSync(): void {
   const state = useEnnajdState.getState();
