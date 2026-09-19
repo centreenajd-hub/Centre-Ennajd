@@ -20,6 +20,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Moon } from "lucide-react";
+
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
 import {
   ALL_SUBJECTS,
@@ -83,6 +85,26 @@ function addMinutesToTime(time: string, minutes: number): string {
   return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
 }
 
+// Same arithmetic as addMinutesToTime but without the modulo, so an overnight
+// end time can legitimately reach hours 24–47 (e.g. "22:55" + 120 → "24:55").
+function addMinutesNoWrap(time: string, minutes: number): string {
+  const [h, m] = time.split(":").map(Number);
+  const total = h * 60 + m + minutes;
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+// <input type="time"> cannot render hours >= 24, so an overnight end stored as
+// e.g. "24:55" is wrapped back to "00:55" for display. The endsNextDay flag
+// re-derives from the (smaller) display value and re-clamps on submit.
+function normalizeTimeForInput(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  if (h < 24) return time;
+  const hours = h - 24;
+  return `${String(hours).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
 export function SessionFormDialog({
   open,
   onOpenChange,
@@ -105,7 +127,7 @@ export function SessionFormDialog({
         groupType: session.groupType,
         dayOfWeek: session.dayOfWeek,
         startTime: session.startTime,
-        endTime: session.endTime,
+        endTime: normalizeTimeForInput(session.endTime),
         teacherName: session.teacherName ?? "",
         kind: getSessionKind(session),
         date: session.date ?? "",
@@ -126,6 +148,9 @@ export function SessionFormDialog({
 
   const trackRequired = isTrackRequired(form.level);
   const combined = isCombinedClass(form.level, form.subject);
+  // Zero-padded "HH:mm" compares lexicographically the same as numerically, so
+  // an end earlier than the start means the session crosses midnight.
+  const endsNextDay = form.endTime < form.startTime;
     const groupApplicable =
       !combined && isGroupTypeApplicable(form.level, form.subject);
     const smallAllowed =
@@ -162,7 +187,7 @@ export function SessionFormDialog({
       groupType: groupApplicable ? form.groupType ?? "Large" : null,
       dayOfWeek,
       startTime: form.startTime,
-      endTime: form.endTime,
+      endTime: endsNextDay ? addMinutesNoWrap(form.endTime, 1440) : form.endTime,
       teacherName: form.teacherName || undefined,
       kind: form.kind,
       date: form.kind === "one_off" ? form.date : null,
@@ -406,6 +431,12 @@ export function SessionFormDialog({
               />
             </div>
           </div>
+          {endsNextDay && (
+            <p className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-500">
+              <Moon className="size-3.5 shrink-0" />
+              {t("sessionEndsNextDay")}
+            </p>
+          )}
 
           <DialogFooter>
             <Button
