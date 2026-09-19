@@ -1,13 +1,6 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useI18n } from "@/lib/i18n";
 
 interface SmallGroupInlineEditProps {
@@ -15,8 +8,7 @@ interface SmallGroupInlineEditProps {
   initialMonth: string;
   initialYear: string;
   initialPhone: string;
-  initialMonths: string; // "1"|"3"|"6"|"12"
-  onSave: (p: { day: string; month: string; year: string; phone: string; months: number }) => void;
+  onSave: (p: { day: string; month: string; year: string; phone: string }) => void;
   onCancel: () => void;
 }
 
@@ -25,7 +17,6 @@ export function SmallGroupInlineEdit({
   initialMonth,
   initialYear,
   initialPhone,
-  initialMonths,
   onSave,
   onCancel,
 }: SmallGroupInlineEditProps) {
@@ -34,11 +25,10 @@ export function SmallGroupInlineEdit({
   const [month, setMonth] = useState(initialMonth);
   const [year, setYear] = useState(initialYear);
   const [phone, setPhone] = useState(initialPhone);
-  const [months, setMonths] = useState(initialMonths);
 
   function handleSave() {
     if (!day || !month || !year) return;
-    onSave({ day, month, year, phone, months: Number(months) });
+    onSave({ day, month, year, phone });
   }
 
   return (
@@ -69,17 +59,6 @@ export function SmallGroupInlineEdit({
             onChange={(e) => setYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
             className="h-9 w-24 rounded-lg text-center"
           />
-          <Select value={months} onValueChange={setMonths}>
-            <SelectTrigger className="h-9 w-24 rounded-lg">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">1 Mois</SelectItem>
-              <SelectItem value="3">3 Mois</SelectItem>
-              <SelectItem value="6">6 Mois</SelectItem>
-              <SelectItem value="12">12 Mois</SelectItem>
-            </SelectContent>
-          </Select>
         </div>
       </div>
       <div className="space-y-1">
