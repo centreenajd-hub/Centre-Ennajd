@@ -1,11 +1,16 @@
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { SmallGroupInlineEdit } from "@/components/payments/SmallGroupInlineEdit";
+import { SmallGroupPaymentHistoryDialog } from "@/components/payments/SmallGroupPaymentHistoryDialog";
 import { SmallGroupPeriodsTable } from "@/components/payments/SmallGroupPeriodsTable";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { addMonthsClamped, formatDateKey, getDueBalanceForStudentSubject } from "@/lib/ennajd-billing";
+import {
+  earliestGroupSessionDate,
+  formatDateKey,
+  getDueBalanceForStudentSubject,
+} from "@/lib/ennajd-billing";
 import { buildWhatsAppLink } from "@/lib/ennajd-whatsapp";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -49,6 +54,9 @@ interface SmallGroupStudentCardProps {
 export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroupStudentCardProps) {
   const { t, lang } = useI18n();
   const payments = useEnnajdState((s) => s.payments);
+  const sessions = useEnnajdState((s) => s.sessions);
+  const attendanceRecords = useEnnajdState((s) => s.attendanceRecords);
+  const students = useEnnajdState((s) => s.students);
   const setPaymentPaid = useEnnajdState((s) => s.setPaymentPaid);
   const updateStudent = useEnnajdState((s) => s.updateStudent);
 
@@ -59,26 +67,38 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
 
   const enrolledAtIso = enrollment?.enrolledAt ?? student.createdAt;
   const enrolledAtParts = useMemo(() => parseIsoDateParts(enrolledAtIso), [enrolledAtIso]);
-  const subscriptionMonths = enrollment?.subscriptionMonths ?? 3;
+
+  // Group anchor: every member of the group shares one due day-of-month,
+  // derived from the group's first session (enrollment-date fallback).
+  const groupAnchorIso = useMemo(() => {
+    if (!enrollment) return null;
+    const anchor = earliestGroupSessionDate(
+      {
+        level: student.level,
+        subject,
+        track: enrollment.track,
+        groupType: enrollment.groupType,
+      },
+      sessions,
+      attendanceRecords,
+      students,
+    );
+    return anchor ? anchor.toISOString() : null;
+  }, [enrollment, student.level, subject, sessions, attendanceRecords, students]);
 
   const balance = useMemo(
     () => getDueBalanceForStudentSubject(payments, student.id, subject, todayKey),
     [payments, student.id, subject, todayKey]
   );
 
-  // PROCHAINE ÉCHÉANCE: earliest due unpaid, else next upcoming, else enrolledAt + n?
-  // Per plan: balance.earliestDueDate ?? balance.nextUpcoming?.dueDate
-  // Fallback: compute enrolledAt + prepaidMonths as display when no installments yet
+  // PROCHAINE ÉCHÉANCE: earliest due unpaid, else next upcoming, else the
+  // group's first-session date.
   const prochaineIso = balance.earliestDueDate ?? balance.nextUpcoming?.dueDate ?? null;
   const prochaineDisplay = useMemo(() => {
     if (prochaineIso) return formatDisplayDateShort(prochaineIso);
     if (!enrollment) return "—";
-    // When no installments (no price), show enrolledAt + subscriptionMonths
-    const base = new Date(enrolledAtIso);
-    if (isNaN(base.getTime())) return "—";
-    const proj = addMonthsClamped(base, subscriptionMonths);
-    return formatDisplayDateShort(proj.toISOString());
-  }, [prochaineIso, enrolledAtIso, enrollment, subscriptionMonths]);
+    return formatDisplayDateShort(groupAnchorIso ?? enrolledAtIso);
+  }, [prochaineIso, groupAnchorIso, enrolledAtIso, enrollment]);
 
   const isOverdue = balance.isOverdue;
   const isPaidUp = !balance.hasInstallments ? false : balance.dueUnpaid.length === 0 && !isOverdue;
@@ -87,6 +107,7 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
 
   const [editing, setEditing] = useState(false);
   const [showPeriods, setShowPeriods] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
 
   function handleWhatsApp() {
     const name = `${student.firstName} ${student.lastName}`;
@@ -119,7 +140,7 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
     toast.success(t("installmentUnpaid"));
   }
 
-  function handleSaveEdit(p: { day: string; month: string; year: string; phone: string; months: number }) {
+  function handleSaveEdit(p: { day: string; month: string; year: string; phone: string }) {
     // Validate phone not empty
     const iso = isoFromDMY(p.day, p.month, p.year);
     if (!iso) {
@@ -135,7 +156,7 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
     }
     const nextEnrollments = student.enrollments.map((e) =>
       e.subject === subject
-        ? { ...e, enrolledAt: iso, subscriptionMonths: p.months }
+        ? { ...e, enrolledAt: iso }
         : e
     );
     // whatsappPhone is on Student, not enrollment — update both in one patch.
@@ -195,7 +216,6 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
             initialMonth={enrolledAtParts.mm}
             initialYear={enrolledAtParts.yyyy}
             initialPhone={student.whatsappPhone}
-            initialMonths={String(subscriptionMonths)}
             onSave={handleSaveEdit}
             onCancel={() => setEditing(false)}
           />
@@ -268,16 +288,19 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
           >
             ↻ {t("correctCancel")}
           </Button>
+          <Button
+            variant="ghost"
+            className="w-full rounded-full text-muted-foreground"
+            onClick={() => setShowHistory(true)}
+          >
+            📋 {t("paymentHistoryButton")}
+          </Button>
         </div>
 
         {/* Footer */}
         <div className="space-y-1 border-t border-border pt-3 text-xs text-muted-foreground">
           <p>
             📅 {t("firstSessionDate")}: <span className="font-medium text-foreground">{formatDisplayDateShort(enrolledAtIso)}</span>
-          </p>
-          <p>
-            # {t("monthlyTransfers")} / {t("monthlyTransfersAr")}:{" "}
-            <span className="font-bold text-foreground"># {subscriptionMonths} {t("monthsCount")}</span>
           </p>
           {enrollment?.paymentNote && (
             <p className="italic text-foreground/70">„{enrollment.paymentNote}“</p>
@@ -289,6 +312,14 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
           )}
         </div>
       </div>
+
+      <SmallGroupPaymentHistoryDialog
+        open={showHistory}
+        onOpenChange={setShowHistory}
+        student={student}
+        subject={subject}
+        todayKey={todayKey}
+      />
     </div>
   );
 }

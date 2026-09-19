@@ -22,6 +22,7 @@ import {
   applyCreditWaterfall,
   buildDeliveredDatesContext,
   dedupePayments,
+  earliestGroupSessionDate,
   earliestValidAttendanceDate,
   formatDateKey,
   generateScheduleFor,
@@ -308,10 +309,21 @@ function generateInstallmentsForStudent(
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
     // Rule A bills from the student's earliest ATTENDANCE date (enrollment
     // fallback) — the engine then anchors each month from that start. Rule B
-    // keeps its fixed rolling cycle anchored on the enrollment date.
+    // anchors on the GROUP's first session date (one shared due
+    // day-of-month for every member; enrollment-date fallback).
     const anchor =
       rule === "B"
-        ? enrolledAt
+        ? (earliestGroupSessionDate(
+            {
+              level: student.level,
+              subject: enrollment.subject,
+              track: enrollment.track,
+              groupType: enrollment.groupType,
+            },
+            state.sessions,
+            state.attendanceRecords,
+            state.students,
+          ) ?? enrolledAt)
         : earliestValidAttendanceDate(
             student.id,
             enrollment.subject,
