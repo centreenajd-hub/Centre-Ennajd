@@ -49,14 +49,13 @@ export type PaymentRule = "A" | "B";
  *
  * The Master Billing & Proration contract:
  *   month_1   = floorMAD(eligible_sessions × (monthly_price / base_sessions))  ← integer, FLOORED
- *   month_2   = monthly_price, absorbing the credit carried from Month 1      ← FULL fee
- *   month_3+  = monthly_price, due on the 1st                                 ← full price
- * A partial start month is billed at its floored prorated value; the month
- * right after it is a FULL-PRICE invoice that absorbs Month 1's carried credit
- * (`monthly_price − month_1_due`), so the parent's next payment is exactly
- * `month_1_due` again (450 paid at enrollment → 337 settles Month 1 and 113
- * rides forward; Month 2 then shows 450 − 113 = 337 to collect). Every figure
- * stays a clean integer, and the waterfall keeps every later gap integer too.
+ *   month_2   = monthly_price − month_1                                        ← the complement
+ *   month_3+  = monthly_price                                                  ← full price
+ * The first monthly price is spread across the two calendar months the first
+ * billing cycle spans (e.g. 337 + 113 = 450), so a partial start month never
+ * costs the parent more than one full month — and never leaves a fractional
+ * remainder to collect. month_2 is an integer by construction (both operands
+ * are), and the waterfall keeps every later gap a clean integer too.
  */
 export function roundMAD(amount: number): number {
   return Math.round(amount);
@@ -494,12 +493,12 @@ function endOfMonth(monthDate: Date): Date {
  * (`billingStart` = first attendance, enrollment fallback).
  *
  * THE TWO-MONTH TRANSITIONAL CYCLE — the start month is prorated (and
- * FLOORED), and the month right after it is a FULL-PRICE invoice. The
- * surplus of an enrollment-time full-fee payment (`monthly_price −
- * month_1_due`) is carried onto that Month-2 row as credit by
- * `applyCreditWaterfall`, so the parent's Month-2 complement is exactly
- * `month_1_due` again (e.g. 337 + 113 credit → 337 to reach 450). From
- * Month 3 on, every month locks to the full monthly price, due on the 1st.
+ * FLOORED), and the month right after it carries the COMPLEMENT of that
+ * first monthly price: `monthly_price − month_1_due` (e.g. 450 − 337 = 113).
+ * The pair totals exactly one monthly price (337 + 113 = 450), so a
+ * mid-cycle join never costs the parent more than one full month and never
+ * leaves a fractional remainder to collect. From Month 3 on, every month
+ * locks to the full monthly price, due on the 1st.
  *
  * Returns `null` ⇒ NO invoice for that month:
  *   - no timetable (fixedCount === 0),
@@ -514,14 +513,37 @@ export function computeMonthInvoice(
   ctx: DeliveredDatesContext,
   price: number,
 ): number | null {
+  // THE MONTH-2 COMPLEMENT — the first monthly price spans the two calendar
+  // months its first billing cycle covers. When the billing-start month is
+  // PARTIAL (its floored prorated invoice is strictly below the monthly
+  // price), the month right after it carries the remainder, so the pair
+  // totals exactly one monthly price: Sept 337 + Oct 113 = 450. Every later
+  // month bills the standard full price. The complement is an integer by
+  // construction (both operands are).
+  const start = normalizeDateOnly(billingStart);
+  const nextKey = formatMonthKey(addMonthsClamped(start, 1));
+  if (monthKey === nextKey) {
+    const month1 = monthInvoiceRaw(start, formatMonthKey(start), ctx, price);
+    // Only when BOTH months are otherwise billable does the remainder ride
+    // on this one — a gap month (or any non-billable month) never inherits
+    // the complement, it simply bills the full price.
+    if (
+      month1 !== null &&
+      month1 < price &&
+      monthInvoiceRaw(start, nextKey, ctx, price) !== null
+    ) {
+      return price - month1;
+    }
+  }
+
   return monthInvoiceRaw(billingStart, monthKey, ctx, price);
 }
 
 /**
  * One month's raw prorated invoice (MAD) under Rule A — the engine's base
- * month math. `computeMonthInvoice` is this, exposed as the public entry
- * point so the two-month transitional cycle (Month 2 = full price + carried
- * credit) has one documented seam.
+ * month math, WITHOUT the Month-2 complement. `computeMonthInvoice` wraps
+ * this to spread the first monthly price across its two calendar months
+ * (Month 1 floored + Month 2 complement).
  *
  *      billable = occurrences of the combo's STANDARD sessions in
  *                  [monthAnchor, monthEnd], capped at fixedCount
@@ -780,10 +802,10 @@ export interface CreditWaterfallResult {
  *   out. Unabsorbed surplus is returned as `remaining` for `advanceBalance`.
  *
  * This IS the two-month transitional cycle's credit carrier: an enrollment-
- * time full-fee payment settles Month 1 at its floored due and parks the
- * surplus (`monthly_price − month_1_due`) on the Month-2 row as partial
- * credit (branch 2), which `getPaymentsToReceive` then surfaces as the
- * Month-2 complement.
+ * time full-fee payment settles Month 1 at its floored due and Month 2 at
+ * its complement (337 + 113 = 450 exactly), with any further surplus landing
+ * on the next month as partial credit (branch 2), which `getPaymentsToReceive`
+ * then surfaces as that month's complement.
  */
 export function applyCreditWaterfall(
   payments: Payment[],
@@ -1739,13 +1761,14 @@ export interface PaymentToReceiveRow {
   isOverdue: boolean;
   /** Full monthly_price of the target month (integer). */
   monthlyPrice: number;
-  /** Credit already carried onto that month (`monthly_price − month_1_due`). */
+  /** Credit already carried onto that month — the wallet surplus. */
   creditCarried: number;
   /**
    * The clean complement integer the parent pays for this month to reach
-   * `monthlyPrice`: `roundMAD(monthlyPrice − creditCarried)`. In the
-   * two-month transitional cycle this is exactly `month_1_due` (450 − 113 =
-   * 337). Never a fraction, by the integer contract.
+   * `monthlyPrice`: `roundMAD(monthlyPrice − creditCarried)`. For the
+   * two-month transitional cycle's Month 2 this is the complement itself
+   * (450 − 337 = 113 owed, 0 on it yet → 113 to collect). Never a fraction,
+   * by the integer contract.
    */
   complement: number;
 }
@@ -1759,9 +1782,10 @@ export interface PaymentToReceiveRow {
  *                   from the `prices` table / `customPrice`, never a hardcoded
  *                   350);
  *   creditCarried — what the wallet already credited to this month (the
- *                   enrollment surplus `monthly_price − month_1_due`, e.g. 113);
+ *                   enrollment surplus, e.g. 113);
  *   complement    — `roundMAD(monthlyPrice − creditCarried)`, the clean whole
- *                   number to collect from the parent (e.g. 337).
+ *                   number to collect from the parent (e.g. 113 for a Month-2
+ *                   complement of 113 with nothing on it yet).
  *
  * Fully-paid months are skipped (complement 0). Sorted by dueDate, then name,
  * so the most pressing collection surfaces first. Pure — no React/Zustand.
