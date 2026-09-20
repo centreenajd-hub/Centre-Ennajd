@@ -4,6 +4,7 @@
 import { describe, it, expect } from "vitest";
 import {
   applyCreditWaterfall,
+  aggregateOverdueInstallments,
   buildDeliveredDatesContext,
   computeExpectedMonthAmount,
   computeMonthInvoice,
@@ -959,6 +960,72 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
     expect(credited.amountPaid).toBe(150);
     expect(credited.isPaid).toBe(false);
     expect(result.remaining).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// aggregateOverdueInstallments — the advance-credit GREEN contract
+// ---------------------------------------------------------------------------
+
+describe("aggregateOverdueInstallments — advance-credit green contract", () => {
+  const TODAY = "2026-10-15"; // mid-October reference date
+
+  it("flags a currently-due partially paid month (0 < amountPaid < amountDue)", () => {
+    const payments: Payment[] = [
+      makePayment("m9", STUDENT_ID, "Math", "2026-09-01", 350, 350, true),
+      makePayment("m10", STUDENT_ID, "Math", "2026-10-01", 350, 120, false),
+    ];
+    const rows = aggregateOverdueInstallments(payments, TODAY);
+    const row = rows.get(`${STUDENT_ID}__Math`);
+    expect(row).toBeDefined();
+    expect(row!.installments).toHaveLength(1);
+    expect(row!.isPartiallyPaid).toBe(true);
+    expect(row!.totalAmountPaid).toBe(120);
+    expect(row!.totalRemaining).toBe(230);
+  });
+
+  it("keeps a fully-unpaid due month red (no partial flag, no paid credit)", () => {
+    const payments: Payment[] = [
+      makePayment("m10", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+    ];
+    const row = aggregateOverdueInstallments(payments, TODAY).get(
+      `${STUDENT_ID}__Math`,
+    );
+    expect(row!.isPartiallyPaid).toBe(false);
+    expect(row!.totalAmountPaid).toBe(0);
+  });
+
+  it("reports the NEXT month's wallet credit on the row (green advance credit)", () => {
+    // Sept + Oct are due & unpaid; November absorbed a 181 DH wallet surplus
+    // via applyCreditWaterfall → 0 < amountPaid < amountDue ⇒ partial.
+    const payments: Payment[] = [
+      makePayment("m9", STUDENT_ID, "Math", "2026-09-01", 350, 0, false),
+      makePayment("m10", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+      makePayment("m11", STUDENT_ID, "Math", "2026-11-01", 350, 181, false),
+    ];
+    const rows = aggregateOverdueInstallments(payments, TODAY);
+    const row = rows.get(`${STUDENT_ID}__Math`);
+    expect(row).toBeDefined();
+    // Only the due months join the worklist — the future month never does.
+    expect(row!.installments.map((p) => p.id)).toEqual(["m9", "m10"]);
+    // The due months are fully unpaid → the amount cell stays non-green; the
+    // future month's credit is carried by the next-due cell instead.
+    expect(row!.isPartiallyPaid).toBe(false);
+    expect(row!.nextDueDate).toBe("2026-11-01");
+    expect(row!.nextDueRemaining).toBe(169); // 350 − 181
+    expect(row!.nextDueAmountPaid).toBe(181);
+  });
+
+  it("never mints a worklist row for a combo whose only debt is future", () => {
+    // A fully-settled combo with a partially-credited future month has
+    // nothing due today → it belongs in the settled worklist, not here.
+    const payments: Payment[] = [
+      makePayment("m10", STUDENT_ID, "Math", "2026-10-01", 350, 350, true),
+      makePayment("m11", STUDENT_ID, "Math", "2026-11-01", 350, 181, false),
+    ];
+    expect(
+      aggregateOverdueInstallments(payments, TODAY).has(`${STUDENT_ID}__Math`),
+    ).toBe(false);
   });
 });
 

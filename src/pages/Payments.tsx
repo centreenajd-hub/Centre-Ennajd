@@ -141,9 +141,11 @@ export default function Payments() {
   };
 
   const ruleAOverdueRows = useMemo(() => {
-    const due = payments.filter(
-      (p) => p.rule === "A" && !p.isPaid && p.dueDate <= todayKey,
-    );
+    // Future installments are passed through on purpose: the aggregator
+    // classifies due vs future itself, and a future month carrying wallet
+    // credit (advance credit) only ENRICHES the row — it never mints one,
+    // so the unpaid worklist still holds exactly the currently-due combos.
+    const due = payments.filter((p) => p.rule === "A" && !p.isPaid);
     const aggregated = aggregateOverdueInstallments(due, todayKey);
     const filtered: SubjectOverdueRow[] = [];
     for (const row of aggregated.values()) {

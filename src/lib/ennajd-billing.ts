@@ -1355,6 +1355,11 @@ export interface SubjectOverdueRow {
    *  forward via advanceBalance). */
   nextDueDate: string | null;
   nextDueRemaining: number;
+  /** Advance credit already sitting on `nextDueDate` — the wallet surplus
+   *  `applyCreditWaterfall` landed there. `> 0` only for a PARTIALLY PAID
+   *  future month (`0 < amountPaid < amountDue`), which the UI MUST render
+   *  GREEN as Advance Credit. */
+  nextDueAmountPaid: number;
 }
 
 export function aggregateOverdueInstallments(
@@ -1366,6 +1371,10 @@ export function aggregateOverdueInstallments(
   for (const payment of payments) {
     const key = `${payment.studentId}__${payment.subject}`;
     let row = rows.get(key);
+    const paid = payment.amountPaid ?? 0;
+    // EXPLICIT partial contract: 0 < amountPaid < amountDue ⇒ the month
+    // carries advance credit and is GREEN, whatever its `isPaid` flag.
+    const isPartiallyPaid = paid > 0 && paid < payment.amountDue;
 
     if (!isPaymentFullyPaid(payment) && payment.dueDate <= todayKey) {
       if (!row) {
@@ -1382,40 +1391,33 @@ export function aggregateOverdueInstallments(
           isHalfMonth: false,
           nextDueDate: null,
           nextDueRemaining: 0,
+          nextDueAmountPaid: 0,
         };
         rows.set(key, row);
       }
 
       row.installments.push(payment);
       row.totalRemaining += getPaymentRemaining(payment);
-      row.totalAmountPaid += payment.amountPaid ?? 0;
+      row.totalAmountPaid += paid;
       if (payment.dueDate < row.earliestDueDate) row.earliestDueDate = payment.dueDate;
       if (payment.dueDate > row.latestDueDate) row.latestDueDate = payment.dueDate;
       if (payment.dueDate < todayKey) row.isOverdue = true;
-      if (isPaymentPartiallyPaid(payment)) row.isPartiallyPaid = true;
+      if (isPartiallyPaid) row.isPartiallyPaid = true;
       if (payment.isHalfMonth) row.isHalfMonth = true;
     }
 
-    if (!isPaymentFullyPaid(payment) && payment.dueDate > todayKey) {
-      if (!row) {
-        row = {
-          studentId: payment.studentId,
-          subject: payment.subject,
-          installments: [],
-          totalRemaining: 0,
-          totalAmountPaid: 0,
-          earliestDueDate: payment.dueDate,
-          latestDueDate: payment.dueDate,
-          isOverdue: false,
-          isPartiallyPaid: false,
-          isHalfMonth: false,
-          nextDueDate: payment.dueDate,
-          nextDueRemaining: getPaymentRemaining(payment),
-        };
-        rows.set(key, row);
-      } else if (row.nextDueDate === null || payment.dueDate < row.nextDueDate) {
+    // The NEXT month never joins the due worklist (Reste guard), but its
+    // advance credit is reported on the row so the UI can flag it GREEN.
+    // A future installment only ENRICHES an existing row — a combo with
+    // nothing due today belongs in the settled worklist, not this one.
+    // Note: it never sets the row-level `isPartiallyPaid` — that flag drives
+    // the AMOUNT cell, which shows due installments only; the future month's
+    // green is carried by `nextDueAmountPaid` in the next-due cell.
+    if (!isPaymentFullyPaid(payment) && payment.dueDate > todayKey && row) {
+      if (row.nextDueDate === null || payment.dueDate < row.nextDueDate) {
         row.nextDueDate = payment.dueDate;
         row.nextDueRemaining = getPaymentRemaining(payment);
+        row.nextDueAmountPaid = paid;
       }
     }
   }

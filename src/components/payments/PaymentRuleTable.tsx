@@ -227,12 +227,26 @@ export function PaymentRuleTable({
                   </TableCell>
                   <TableCell className="text-end whitespace-nowrap">
                     {row.nextDueDate ? (
-                      <span className="text-sm">
-                        {row.nextDueDate}
-                        {row.nextDueRemaining > 0
-                          ? ` · ${row.nextDueRemaining} MAD`
-                          : " · " + t("advanceApplied")}
-                      </span>
+                      <div className="flex flex-col items-end gap-0.5">
+                        <span
+                          className={cn(
+                            "text-sm",
+                            row.nextDueAmountPaid > 0
+                              ? "font-semibold text-success"
+                              : "text-muted-foreground",
+                          )}
+                        >
+                          {row.nextDueDate}
+                          {row.nextDueRemaining > 0
+                            ? ` · ${row.nextDueRemaining} MAD`
+                            : " · " + t("advanceApplied")}
+                        </span>
+                        {row.nextDueAmountPaid > 0 && (
+                          <span className="text-xs font-bold text-success">
+                            {t("paidSoFar")} {row.nextDueAmountPaid} MAD
+                          </span>
+                        )}
+                      </div>
                     ) : (
                       "—"
                     )}
@@ -358,12 +372,24 @@ export function PaymentRuleTable({
                 </p>
               )}
               {row.nextDueDate && (
-                <p className="mt-1 text-xs text-accent-foreground/80">
+                <p
+                  className={cn(
+                    "mt-1 text-xs",
+                    row.nextDueAmountPaid > 0
+                      ? "font-bold text-success"
+                      : "text-accent-foreground/80",
+                  )}
+                >
                   <span className="font-medium">{t("nextDueColumn")} :</span>{" "}
                   {row.nextDueDate}{" "}
                   {row.nextDueRemaining > 0
                     ? `· ${row.nextDueRemaining} MAD`
                     : `· ${t("advanceApplied")}`}
+                  {row.nextDueAmountPaid > 0 && (
+                    <span className="ms-1.5">
+                      · {t("paidSoFar")} {row.nextDueAmountPaid} MAD
+                    </span>
+                  )}
                 </p>
               )}
               {note && <PaymentNoteLine note={note} />}
