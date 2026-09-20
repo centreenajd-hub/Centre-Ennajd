@@ -297,15 +297,15 @@ describe("reactive ledger — markAttendance trigger", () => {
     // to 6 × 43.75 = 262.5 → the FLOORED 262, dated on the anchor.
     expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    // October is the transition month: the full 350 (never the remainder),
-    // absorbing the 88 carried credit (350 − 262) → 262 to collect.
-    expect(ledger.get("2026-10")!.amountDue).toBe(350);
+    // October is the transition month: the 88 complement (350 − 262), so the
+    // Sept+Oct pair totals exactly one full monthly price.
+    expect(ledger.get("2026-10")!.amountDue).toBe(88);
   });
 
   it("re-bills Sept from a pre-registration attendance mark", async () => {
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219),
-      payment("oct", "2026-10-01", 350),
+      payment("sept", "2026-09-15", 218),
+      payment("oct", "2026-10-01", 132),
       payment("nov", "2026-11-01", 350),
     ]);
 
@@ -318,13 +318,14 @@ describe("reactive ledger — markAttendance trigger", () => {
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    expect(ledger.get("2026-10")!.amountDue).toBe(350); // the full price
+    // The 10/09 anchor re-prices October to the 88 complement (350 − 262).
+    expect(ledger.get("2026-10")!.amountDue).toBe(88);
   });
 
   it("keeps exactly one installment per month after re-anchoring", async () => {
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219),
-      payment("oct", "2026-10-01", 350),
+      payment("sept", "2026-09-15", 218),
+      payment("oct", "2026-10-01", 132),
     ]);
 
     await useEnnajdState
@@ -341,8 +342,8 @@ describe("reactive ledger — markAttendance trigger", () => {
     // enrollment anchor. A 17/09 attendance mark would drop the engine's
     // September charge to 175 and would previously have rolled the 175
     // surplus onto October — but the settled row is immutable. It keeps its
-    // amountDue, its payment and its green status; October is already at the
-    // full price, so the 17/09 anchor leaves it untouched too.
+    // amountDue, its payment and its green status; October is re-priced to
+    // the 175 complement (350 − 175) but carries no credit.
     seedRuleALedger([
       payment("sept", "2026-09-15", 350, "A", 350),
       payment("oct", "2026-10-01", 350),
@@ -358,17 +359,18 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(sept.amountDue).toBe(350); // untouched
     expect(sept.amountPaid).toBe(350); // untouched
     expect(sept.isPaid).toBe(true); // still green
-    // October was already at the full price — the anchor move leaves it as is.
-    expect(ledger.get("2026-10")!.amountDue).toBe(350);
+    // October absorbed the re-anchor's complement; the wallet is empty, so
+    // it carries no credit.
+    expect(ledger.get("2026-10")!.amountDue).toBe(175); // 350 − 175
     expect(ledger.get("2026-10")!.amountPaid).toBe(0);
   });
 
   it("lands carried wallet surplus on the next UNSETTLED month as green credit", async () => {
     // Sept settled, 500 DH parked in the wallet — the enrollment-time
     // full-fee surplus. A mark on the enrollment date re-derives the ledger.
-    // The settled September row is immutable, so the wallet surplus fully
-    // covers the rebuilt October (350) and the remaining 150 lands on
-    // November as green advance credit.
+    // The settled September row is immutable, so the wallet surplus covers
+    // the rebuilt October complement (132), November's full 350, and the
+    // last 18 lands on December as green advance credit.
     seedRuleALedger(
       [
         payment("sept", "2026-09-15", 218, "A", 218),
@@ -385,11 +387,17 @@ describe("reactive ledger — markAttendance trigger", () => {
 
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountPaid).toBe(218); // untouched
-    expect(ledger.get("2026-10")!.amountDue).toBe(350);
-    expect(ledger.get("2026-10")!.amountPaid).toBe(350); // wallet covered it
+    expect(ledger.get("2026-10")!.amountDue).toBe(132); // the complement
+    expect(ledger.get("2026-10")!.amountPaid).toBe(132); // wallet covered it
     expect(ledger.get("2026-10")!.isPaid).toBe(true);
-    expect(ledger.get("2026-11")!.amountPaid).toBe(150); // the remainder, green
-    expect(ledger.get("2026-11")!.isPaid).toBe(false);
+    expect(ledger.get("2026-11")!.amountDue).toBe(350);
+    expect(ledger.get("2026-11")!.amountPaid).toBe(350); // green
+    expect(ledger.get("2026-11")!.isPaid).toBe(true);
+    // The generation horizon (now + 1 month) reaches December, so the 18
+    // tail lands on it instead of parking in the wallet.
+    expect(ledger.get("2026-12")!.amountDue).toBe(350);
+    expect(ledger.get("2026-12")!.amountPaid).toBe(18);
+    expect(ledger.get("2026-12")!.isPaid).toBe(false);
     expect(walletBalance()).toBe(0); // wallet drained
 
     const db = await import("@/lib/dbServices");
@@ -398,8 +406,8 @@ describe("reactive ledger — markAttendance trigger", () => {
 
   it("commits the rebuild in ONE payments write (single-write contract)", async () => {
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219),
-      payment("oct", "2026-10-01", 350),
+      payment("sept", "2026-09-15", 218),
+      payment("oct", "2026-10-01", 132),
     ]);
     vi.clearAllMocks();
 
@@ -437,7 +445,7 @@ describe("reactive ledger — markAttendance trigger", () => {
   });
 
   it("is idempotent — a second mark of the same date moves nothing", async () => {
-    seedRuleALedger([payment("sept", "2026-09-15", 219)]);
+    seedRuleALedger([payment("sept", "2026-09-15", 218)]);
 
     const store = useEnnajdState.getState();
     await store.markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
@@ -464,9 +472,9 @@ describe("reactive ledger — markAttendance trigger", () => {
     // re-dated survivor is upserted, or the unique(student, subject,
     // due_date) index would reject the whole batch.
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219),
+      payment("sept", "2026-09-15", 218),
       payment("sept-dup", "2026-09-17", 100),
-      payment("oct", "2026-10-01", 350),
+      payment("oct", "2026-10-01", 132),
       payment("nov", "2026-11-01", 350),
     ]);
 
@@ -494,7 +502,7 @@ describe("reactive ledger — markAttendance trigger", () => {
   });
 
   it("never blocks on a persistence failure (warning toast, kept attendance)", async () => {
-    seedRuleALedger([payment("sept", "2026-09-15", 219)]);
+    seedRuleALedger([payment("sept", "2026-09-15", 218)]);
     mockState.failNextPaymentBatch = true;
 
     const ok = await useEnnajdState
@@ -581,8 +589,8 @@ describe("regeneratePaymentLedger", () => {
 
   it("rebuilds Rule A, keeps Rule B, and deletes before inserting", async () => {
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219),
-      payment("oct", "2026-10-01", 350),
+      payment("sept", "2026-09-15", 218),
+      payment("oct", "2026-10-01", 132),
       payment("ruleB", "2026-10-15", 500, "B"),
     ]);
 
@@ -625,7 +633,7 @@ describe("regeneratePaymentLedger", () => {
     // it is never part of the delete batch nor the rebuild. Only the
     // unsettled October row is deleted and regenerated.
     seedRuleALedger([
-      payment("sept", "2026-09-15", 219, "A", 219), // settled
+      payment("sept", "2026-09-15", 218, "A", 218), // settled
       payment("oct", "2026-10-01", 350), // unsettled
     ]);
 
@@ -639,13 +647,13 @@ describe("regeneratePaymentLedger", () => {
 
     // The settled row survived untouched.
     const sept = useEnnajdState.getState().payments.find((p) => p.id === "sept")!;
-    expect(sept.amountDue).toBe(219);
-    expect(sept.amountPaid).toBe(219);
+    expect(sept.amountDue).toBe(218);
+    expect(sept.amountPaid).toBe(218);
     expect(sept.isPaid).toBe(true);
   });
 
   it("rolls back and surfaces the real DB error when the write fails", async () => {
-    seedRuleALedger([payment("sept", "2026-09-15", 219)]);
+    seedRuleALedger([payment("sept", "2026-09-15", 218)]);
     mockState.failNextPaymentBatch = true;
 
     const ok = await useEnnajdState.getState().regeneratePaymentLedger();
@@ -677,12 +685,13 @@ describe("recordPartialPayment — waterfall", () => {
   });
 
   it("absorbs a 350 payment as Sept 175 + Oct 175, one row per month", async () => {
-    // The September amount is 175 (a 17/09 joiner, 4 sessions × 43.75). A
-    // 350 payment fills Sept entirely and lands the 175 surplus on October's
-    // gap — never on a second September row.
+    // A 17/09 joiner: September is 175 (4 sessions × 43.75) and October
+    // carries the 175 complement (350 − 175), so the pair totals exactly one
+    // monthly price. A 350 payment settles both — never a second September
+    // row.
     seedRuleALedger([
       payment("sept", "2026-09-17", 175),
-      payment("oct", "2026-10-01", 350),
+      payment("oct", "2026-10-01", 175),
       payment("nov", "2026-11-01", 350),
     ]);
 
@@ -694,8 +703,8 @@ describe("recordPartialPayment — waterfall", () => {
     expect(ledger.get("2026-09")!.amountPaid).toBe(175);
     expect(isPaymentFullyPaid(ledger.get("2026-09")!)).toBe(true);
     expect(ledger.get("2026-10")!.amountPaid).toBe(175);
-    expect(ledger.get("2026-10")!.amountDue).toBe(350);
-    expect(ledger.get("2026-10")!.isPaid).toBe(false);
+    expect(ledger.get("2026-10")!.amountDue).toBe(175);
+    expect(ledger.get("2026-10")!.isPaid).toBe(true);
     // November untouched — the waterfall stops when the credit runs out.
     expect(ledger.get("2026-11")!.amountPaid).toBe(0);
 
@@ -716,7 +725,7 @@ describe("recordPartialPayment — waterfall", () => {
     const oct = (await upsertedRows()).find((p) => p.id === "oct");
     expect(oct).toBeDefined();
     expect(oct!.amountPaid).toBe(175);
-    expect(oct!.isPaid).toBe(false);
+    expect(oct!.isPaid).toBe(true);
     // No id ships twice in the batch.
     const ids = (await upsertedRows()).map((p) => p.id);
     expect(ids).toEqual([...new Set(ids)]);
