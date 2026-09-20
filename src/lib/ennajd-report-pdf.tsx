@@ -48,6 +48,7 @@ const BW_PALETTE = {
   white: "#ffffff",
   black: "#000000",
   green: "#1e9e50", // For PAIEMENT column only
+  red: "#b00020", // Unpaid / complement badges only
   gray: "#666666",
   lightGray: "#cccccc",
 };
@@ -437,9 +438,55 @@ const reportStyles = StyleSheet.create({
     textAlign: "center",
   },
 
+  // Unpaid month's monthly fee — same weight as a paid amount, red so the
+  // complement owed is never mistaken for settled.
+  paymentsAmountUnpaid: {
+    fontSize: 7.5,
+    fontWeight: 700,
+    textAlign: "center",
+    color: BW_PALETTE.red,
+  },
+
+  // "Payé" badge under a settled month's amount.
+  paymentsBadgePaid: {
+    fontSize: 5.5,
+    fontWeight: 700,
+    textAlign: "center",
+    color: BW_PALETTE.green,
+  },
+
+  // "Impayée" badge under an unsettled month's amount.
+  paymentsBadgeUnpaid: {
+    fontSize: 5.5,
+    fontWeight: 700,
+    textAlign: "center",
+    color: BW_PALETTE.red,
+  },
+
+  // Complement line: "Reste X" under a partially-paid month's credit.
+  paymentsRemaining: {
+    fontSize: 5.5,
+    fontWeight: 600,
+    textAlign: "center",
+    color: BW_PALETTE.gray,
+  },
+
   paymentsDash: {
     fontSize: 7.5,
     textAlign: "center",
+  },
+
+  // Legend under the payments table explaining the per-cell badges.
+  legendContainer: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginTop: 4,
+  },
+
+  legendText: {
+    fontSize: 6,
+    color: BW_PALETTE.gray,
+    marginRight: 6,
   },
 
   // Grand total row
@@ -979,29 +1026,37 @@ function PaymentsPage({
                     </View>
                   );
                 }
-                if (!cell.isPaid) {
-                  // Partial months show what was actually covered plus the
-                  // remaining, so a partially-paid month is never mistaken
-                  // for a fully paid one in the printed matrix.
-                  if (cell.isPartiallyPaid) {
-                    return (
-                      <View key={month.key} style={reportStyles.paymentsBodyCell}>
-                        <Text style={reportStyles.paymentsAmountText}>{cell.amountPaid}</Text>
-                        <Text style={reportStyles.paymentsDash}>
-                          ({t("remainingAmount")} {cell.remaining})
-                        </Text>
-                      </View>
-                    );
-                  }
+                if (cell.isPaid) {
                   return (
                     <View key={month.key} style={reportStyles.paymentsBodyCell}>
-                      <Text style={reportStyles.paymentsDash}>-</Text>
+                      <Text style={reportStyles.paymentsAmountText}>{cell.amountDue}</Text>
+                      <Text style={reportStyles.paymentsBadgePaid}>{t("paid")}</Text>
                     </View>
                   );
                 }
+                if (cell.isPartiallyPaid) {
+                  // Partial months show the credit already carried plus the
+                  // remaining complement, so a partially-paid month is never
+                  // mistaken for a fully paid one in the printed matrix.
+                  return (
+                    <View key={month.key} style={reportStyles.paymentsBodyCell}>
+                      <Text style={reportStyles.paymentsAmountText}>{cell.amountPaid}</Text>
+                      <Text style={reportStyles.paymentsRemaining}>
+                        {t("remainingAmount")} {cell.remaining}
+                      </Text>
+                    </View>
+                  );
+                }
+                // UNPAID — the screen renders amountDue in red for this same
+                // cell. The PDF must show the monthly fee and its unsettled
+                // status too: the complement owed IS the amount here, so a
+                // bare dash would silently drop the debt from the report.
                 return (
                   <View key={month.key} style={reportStyles.paymentsBodyCell}>
-                    <Text style={reportStyles.paymentsAmountText}>{cell.amountDue}</Text>
+                    <Text style={reportStyles.paymentsAmountUnpaid}>{cell.amountDue}</Text>
+                    <Text style={reportStyles.paymentsBadgeUnpaid}>
+                      {t("remainingAmount")} {cell.remaining}
+                    </Text>
                   </View>
                 );
               })}
@@ -1028,6 +1083,20 @@ function PaymentsPage({
             </View>
           </View>
         )}
+      </View>
+
+      {/* Legend */}
+      <View style={reportStyles.legendContainer}>
+        <Text style={reportStyles.legendText}>{t("legendMonthlyFee")}</Text>
+        <Text style={[reportStyles.legendText, { color: BW_PALETTE.green }]}>
+          {t("paid")} : {t("legendPaid")}
+        </Text>
+        <Text style={reportStyles.legendText}>
+          {t("remainingAmount")} : {t("legendRemaining")}
+        </Text>
+        <Text style={[reportStyles.legendText, { color: BW_PALETTE.red }]}>
+          {t("unpaid")} : {t("legendUnpaid")}
+        </Text>
       </View>
     </Page>
   );

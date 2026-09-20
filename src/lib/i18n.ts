@@ -410,6 +410,10 @@ const dictionary = {
     saveFailed: "Échec de l'enregistrement",
     advanceCredit: "Crédit d'avance",
     advanceCreditBadge: "Crédit d'avance",
+    legendMonthlyFee: "Mensualité (MAD)",
+    legendPaid: "mois réglé",
+    legendRemaining: "complément à payer",
+    legendUnpaid: "mois non réglé",
     advanceApplied: "Crédit d'avance appliqué",
     advanceCreditCarryOver:
       "{amount} MAD seront appliqués à la facture du mois prochain",
@@ -811,6 +815,10 @@ const dictionary = {
     saveFailed: "فشل الحفظ",
     advanceCredit: "رصيد مقدماً",
     advanceCreditBadge: "رصيد مسبق",
+    legendMonthlyFee: "القسط الشهري (درهم)",
+    legendPaid: "شهر تم أداؤه",
+    legendRemaining: "المبلغ المتبقي",
+    legendUnpaid: "شهر لم يُؤدَّ",
     advanceApplied: "تم تطبيق الرصيد المتقدّن",
     advanceCreditCarryOver:
       "سيتم تطبيق {amount} درهم على فاتورة الشهر القادم",
