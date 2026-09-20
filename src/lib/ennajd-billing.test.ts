@@ -795,7 +795,7 @@ describe("applyCreditWaterfall", () => {
       makePayment("p2", STUDENT_ID, "PC", "2025-02-01", 300),
     ];
     const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 100, "2025-01-15", NOW);
-    expect(result.remaining).toBe(200);
+    expect(result.remaining).toBe(0); // wallet fully absorbed on p2's 300 gap
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p2");
     expect(result.updated[0].amountPaid).toBe(100);
@@ -810,6 +810,155 @@ describe("applyCreditWaterfall", () => {
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(1);
     expect(result.updated[0].id).toBe("p1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule A carryover contract — surplus beyond the prorated first month lands
+// on the next month as partial credit (green), and any remainder parks in
+// advance_balance. amountDue values mirror the engine's dynamic output for
+// a 350 DH subject joined mid-month (219 = 5/8 prorated first month).
+// ---------------------------------------------------------------------------
+
+describe("applyCreditWaterfall — Rule A carryover contract", () => {
+  const PRORATED_FIRST = 219; // 5 × 43.75
+  const FULL_MONTH = 350;
+
+  function specPayments(): Payment[] {
+    return [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", PRORATED_FIRST),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", FULL_MONTH),
+      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", FULL_MONTH),
+    ];
+  }
+
+  it("(a) surplus beyond the prorated first month lands on the next month as partial credit, and any remainder parks as advance_balance", () => {
+    // 400 − 219 = 181 surplus → October is PARTIALLY PAID (green chip),
+    // wallet exhausted, nothing parks.
+    const partial = applyCreditWaterfall(
+      specPayments(),
+      STUDENT_ID,
+      "Math",
+      400,
+      "2026-09-30",
+      NOW,
+    );
+    const byId = new Map(partial.updated.map((p) => [p.id, p]));
+    expect(byId.get("sept")!.amountPaid).toBe(PRORATED_FIRST);
+    expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(true);
+    expect(byId.get("oct")!.amountPaid).toBe(181); // green advance credit
+    expect(byId.get("oct")!.isPaid).toBe(false);
+    expect(byId.get("nov")).toBeUndefined(); // wallet dry
+    expect(partial.remaining).toBe(0); // advance_balance untouched
+
+    // 619 = 219 + 350 + 50 → Sept & Oct fully paid, Nov partial, nothing parks.
+    const threeWay = applyCreditWaterfall(
+      specPayments(),
+      STUDENT_ID,
+      "Math",
+      619,
+      "2026-09-30",
+      NOW,
+    );
+    const byId3 = new Map(threeWay.updated.map((p) => [p.id, p]));
+    expect(isPaymentFullyPaid(byId3.get("sept")!)).toBe(true);
+    expect(isPaymentFullyPaid(byId3.get("oct")!)).toBe(true);
+    expect(byId3.get("nov")!.amountPaid).toBe(50);
+    expect(byId3.get("nov")!.isPaid).toBe(false);
+    expect(threeWay.remaining).toBe(0);
+
+    // 1000 covers every gap with 81 left over → the remainder parks in
+    // advance_balance (returned as `remaining` for the caller to store).
+    const surplus = applyCreditWaterfall(
+      specPayments(),
+      STUDENT_ID,
+      "Math",
+      1000,
+      "2026-09-30",
+      NOW,
+    );
+    expect(surplus.updated.every(isPaymentFullyPaid)).toBe(true);
+    expect(surplus.remaining).toBe(1000 - PRORATED_FIRST - 2 * FULL_MONTH); // 81
+  });
+
+  it("(b) a wallet exactly covering multiple months leaves them fully paid with zero remainder", () => {
+    const exact = PRORATED_FIRST + 2 * FULL_MONTH; // 919
+    const result = applyCreditWaterfall(
+      specPayments(),
+      STUDENT_ID,
+      "Math",
+      exact,
+      "2026-09-30",
+      NOW,
+    );
+    expect(result.remaining).toBe(0);
+    expect(result.updated).toHaveLength(3);
+    // No partial month: every credited row is settled, none left green.
+    expect(result.updated.every((p) => isPaymentFullyPaid(p))).toBe(true);
+    expect(result.updated.every((p) => p.isPaid)).toBe(true);
+  });
+
+  it("(c) a wallet fully absorbed by the first gap leaves advance_balance at 0", () => {
+    // 100 < 219 → September is partially paid and the wallet hits 0, so
+    // nothing parks and later months are untouched.
+    const result = applyCreditWaterfall(
+      specPayments(),
+      STUDENT_ID,
+      "Math",
+      100,
+      "2026-09-30",
+      NOW,
+    );
+    expect(result.remaining).toBe(0);
+    expect(result.updated).toHaveLength(1);
+    expect(result.updated[0].id).toBe("sept");
+    expect(result.updated[0].amountPaid).toBe(100);
+    expect(result.updated[0].isPaid).toBe(false);
+  });
+
+  it("(d) never re-prices or re-dates Rule B rows, and leaves other subjects' rows untouched", () => {
+    const ruleBRow = makePayment(
+      "ruleb",
+      STUDENT_ID,
+      "Math",
+      "2026-09-15",
+      500,
+      0,
+      false,
+      "B",
+    );
+    const otherSubjectRow = makePayment(
+      "other",
+      STUDENT_ID,
+      "PC",
+      "2026-09-01",
+      300,
+      0,
+      false,
+      "B",
+    );
+
+    // Per-subject waterfall: the other subject's row is out of scope entirely.
+    const result = applyCreditWaterfall(
+      [ruleBRow, otherSubjectRow],
+      STUDENT_ID,
+      "Math",
+      150,
+      "2026-09-30",
+      NOW,
+    );
+    expect(result.updated).toHaveLength(1);
+    const credited = result.updated[0];
+    // The in-scope Rule B row may absorb wallet credit (it is still owed),
+    // but the waterfall never re-prices or re-dates it — the Rule B anchor,
+    // amount, and rule field are frozen.
+    expect(credited.id).toBe("ruleb");
+    expect(credited.amountDue).toBe(500);
+    expect(credited.dueDate).toBe("2026-09-15");
+    expect(credited.rule).toBe("B");
+    expect(credited.amountPaid).toBe(150);
+    expect(credited.isPaid).toBe(false);
+    expect(result.remaining).toBe(0);
   });
 });
 

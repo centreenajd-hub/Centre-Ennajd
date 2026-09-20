@@ -408,7 +408,10 @@ function generateInstallmentsForStudent(
  * `advanceBalance` stays a deliberate second write — it targets the
  * `students` table (a different realtime channel), so its echo cannot
  * clobber the payments ledger. Optimistic throughout: the store is set
- * first and rolled back to the snapshotted slices on failure.
+ * first, and on failure only the slice(s) that never reached the DB are
+ * rolled back — a payments write that succeeded keeps its credited rows
+ * (they are persisted), so a later balance-write failure can no longer
+ * discard them and flip a month back to red.
  */
 async function commitWaterfallSingleWrite(args: {
   studentId: string;
@@ -468,41 +471,52 @@ async function commitWaterfallSingleWrite(args: {
 
   // 6. ONE optimistic `set`: patch the credited existing rows, append the
   // (possibly credited) generated rows, and park the surplus — computed
-  // unconditionally, fixing the latent lost-credit bug.
+  // unconditionally, fixing the latent lost-credit bug. The wallet is only
+  // touched when it ACTUALLY changes, so it is never double-counted.
   const prevBalance =
     previousStudents.find((s) => s.id === studentId)?.advanceBalance ?? 0;
   const nextBalance = prevBalance + remaining;
+  const balanceChanged = nextBalance !== prevBalance;
   const generatedRows = rows.filter((p) => generatedIds.has(p.id));
   useEnnajdState.setState((s) => ({
     payments: [
       ...s.payments.map((p) => patchById.get(p.id) ?? p),
       ...generatedRows,
     ],
-    students:
-      remaining > 0
-        ? s.students.map((st) =>
-            st.id === studentId ? { ...st, advanceBalance: nextBalance } : st,
-          )
-        : s.students,
+    students: balanceChanged
+      ? s.students.map((st) =>
+          st.id === studentId ? { ...st, advanceBalance: nextBalance } : st,
+        )
+      : s.students,
   }));
+
+  // Track which slice actually reached the DB. On failure we revert ONLY
+  // the slice(s) that never persisted — a successful payments write keeps
+  // its credited rows in the store (they are in the DB too), so a later
+  // balance-write failure can no longer silently drop them to red.
+  let paymentsPersisted = rows.length === 0;
+  let balancePersisted = !balanceChanged;
 
   try {
     // 7. The ONLY payments write. Its echo can only re-deliver content the
     // store already holds.
     if (rows.length > 0) {
       await upsertPaymentsBatchDoc(rows);
+      paymentsPersisted = true;
     }
     // 8. Separate table → separate realtime channel; carries the correct
     // final balance, computed once.
-    if (remaining > 0) {
+    if (balanceChanged) {
       await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      balancePersisted = true;
     }
   } catch (err) {
-    // 9. Roll back both slices, warn, and rethrow when the caller asked.
-    useEnnajdState.setState({
-      payments: previousPayments,
-      students: previousStudents,
-    });
+    // 9. Roll back only what never reached the DB, warn, and rethrow when
+    // the caller asked.
+    useEnnajdState.setState((s) => ({
+      payments: paymentsPersisted ? s.payments : previousPayments,
+      students: balancePersisted ? s.students : previousStudents,
+    }));
     toast.error(t("paymentSaveFailed"));
     if (rethrow) throw err;
   }

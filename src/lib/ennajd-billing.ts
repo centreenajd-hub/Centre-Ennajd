@@ -668,8 +668,19 @@ export interface CreditWaterfallResult {
 
 /**
  * Distributes `credit` (MAD) across the student's not-fully-paid installments
- * in dueDate-ascending order, filling each remaining gap
- * (`amountDue − amountPaid`).
+ * in dueDate-ascending order, using the explicit 3-branch waterfall per row:
+ *
+ * 1. FULLY PAID — `wallet >= monthDueAmount`: the wallet covers the month's
+ *    whole remaining gap; the row is settled and the wallet is debited.
+ * 2. PARTIALLY PAID — `0 < wallet < monthDueAmount`: the wallet is fully
+ *    absorbed as partial credit on this month (the GREEN advance-credit
+ *    chip); the row stays unpaid and the wallet hits 0. Any further surplus
+ *    would only park in `advance_balance` — there is none left here.
+ * 3. UNPAID — `wallet === 0`: nothing left to give; the row is untouched.
+ *
+ * `monthDueAmount` is the row's dynamic remaining gap (`amountDue` −
+ * `amountPaid`), where `amountDue` itself comes from `computeMonthInvoice`
+ * (student-specific price + attendance) — never a hardcoded number.
  *
  * - `subject === null` → cross-subject (creation-time waterfall);
  *   otherwise only that subject's installments are credited.
@@ -698,26 +709,47 @@ export function applyCreditWaterfall(
     .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
   const updated: Payment[] = [];
-  let remaining = Math.max(0, Math.round(credit));
+  let remainingWallet = Math.max(0, Math.round(credit));
 
   for (const payment of eligible) {
-    if (remaining <= 0) break;
-    const gap = Math.max(0, payment.amountDue - (payment.amountPaid ?? 0));
-    if (gap <= 0) continue;
-    const apply = Math.min(gap, remaining);
-    const amountPaid = (payment.amountPaid ?? 0) + apply;
-    updated.push({
-      ...payment,
-      amountPaid,
-      isPaid: amountPaid >= payment.amountDue,
-      updatedAt,
-    });
-    remaining -= apply;
+    // Branch 3 — UNPAID: the wallet is exhausted, no further row can be
+    // credited. Later rows stay exactly as they were.
+    if (remainingWallet === 0) break;
+
+    // The dynamic amount this month still owes — the engine's
+    // `computeMonthInvoice`-derived `amountDue` minus already-paid credit.
+    const monthDueAmount = Math.max(
+      0,
+      payment.amountDue - (payment.amountPaid ?? 0),
+    );
+    if (monthDueAmount === 0) continue;
+
+    if (remainingWallet >= monthDueAmount) {
+      // Branch 1 — FULLY PAID: the wallet absorbs the month entirely.
+      updated.push({
+        ...payment,
+        amountPaid: payment.amountDue,
+        isPaid: true,
+        updatedAt,
+      });
+      remainingWallet -= monthDueAmount;
+    } else {
+      // Branch 2 — PARTIALLY PAID: the wallet lands as partial credit and
+      // is fully absorbed; any surplus beyond this parks in
+      // `advance_balance` at the caller (nothing remains here).
+      updated.push({
+        ...payment,
+        amountPaid: (payment.amountPaid ?? 0) + remainingWallet,
+        isPaid: false,
+        updatedAt,
+      });
+      remainingWallet = 0;
+    }
   }
 
   return {
     updated,
-    remaining: Math.max(0, remaining),
+    remaining: Math.max(0, remainingWallet),
     anyChanged: updated.length > 0,
   };
 }
