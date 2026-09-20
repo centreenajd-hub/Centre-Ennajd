@@ -47,12 +47,14 @@ export type PaymentRule = "A" | "B";
  * `advanceBalance` / report figure passes through here.
  *
  * The Month-2 complement contract:
- *   raw_month_1   = eligible_sessions × (monthly_price / base_sessions)
- *   month_2_to_pay = roundMAD(raw_month_1)          ← clean integer
- *   month_1_due    = monthly_price − month_2_to_pay  ← integer by construction
- * The engine emits `roundMAD` for each prorated month, and the credit
- * waterfall carries the surplus forward, so the next month's remaining gap
- * (`monthly_price − credit_carried`) is itself a clean integer.
+ *   month_1   = roundMAD(eligible_sessions × (monthly_price / base_sessions))  ← integer
+ *   month_2   = monthly_price − month_1                                        ← the complement
+ *   month_3+  = monthly_price                                                  ← full price
+ * The first monthly price is spread across the two calendar months the first
+ * billing cycle spans (e.g. 394 + 56 = 450), so a partial start month never
+ * costs the parent more than one full month — and never leaves a fractional
+ * remainder to collect. month_2 is an integer by construction (both operands
+ * are), and the waterfall keeps every later gap a clean integer too.
  */
 export function roundMAD(amount: number): number {
   return Math.round(amount);
@@ -492,6 +494,59 @@ export function computeMonthInvoice(
   ctx: DeliveredDatesContext,
   price: number,
 ): number | null {
+  // THE MONTH-2 COMPLEMENT — the first monthly price spans the two calendar
+  // months its first billing cycle covers. When the billing-start month is
+  // PARTIAL (its prorated invoice is strictly below the monthly price), the
+  // month right after it carries the remainder, so the pair totals exactly
+  // one monthly price: Sept 394 + Oct 56 = 450. Every later month bills the
+  // standard full price. The complement is an integer by construction.
+  const start = normalizeDateOnly(billingStart);
+  const nextKey = formatMonthKey(addMonthsClamped(start, 1));
+  if (monthKey === nextKey) {
+    const month1 = monthInvoiceRaw(start, formatMonthKey(start), ctx, price);
+    // Only when BOTH months are otherwise billable does the remainder ride
+    // on this one — a gap month (or any non-billable month) never inherits
+    // the complement, it simply bills nothing.
+    if (
+      month1 !== null &&
+      month1 < price &&
+      monthInvoiceRaw(start, nextKey, ctx, price) !== null
+    ) {
+      return price - month1;
+    }
+  }
+
+  return monthInvoiceRaw(billingStart, monthKey, ctx, price);
+}
+
+/**
+ * One month's raw prorated invoice (MAD) under Rule A — the engine's base
+ * month math, WITHOUT the Month-2 complement. `computeMonthInvoice` wraps
+ * this to spread the first monthly price across its two calendar months.
+ *
+ *      billable = occurrences of the combo's STANDARD sessions in
+ *                  [monthAnchor, monthEnd], capped at fixedCount
+ *      amount    = round(effectivePrice ÷ fixedCount × billable)
+ *
+ * The month ANCHOR is PER-MONTH (Rule 2): the month's own earliest PRESENT
+ * attendance when it has one (billing starts with that session, inclusive),
+ * otherwise the 1st of the month (→ full month). The first month the
+ * student is billed is the one containing their global billing start
+ * (`billingStart` = first attendance, enrollment fallback).
+ *
+ * Returns `null` ⇒ NO invoice for that month:
+ *   - no timetable (fixedCount === 0),
+ *   - the month is entirely before the billing start,
+ *   - a gap month (zero scheduled occurrences),
+ *   - the billing-start month leaves ≤ 1 billable session (a lone remaining
+ *     session is FREE — no installment is emitted).
+ */
+function monthInvoiceRaw(
+  billingStart: Date,
+  monthKey: string,
+  ctx: DeliveredDatesContext,
+  price: number,
+): number | null {
   const fixedCount = getFixedSessionCount(ctx);
   if (fixedCount === 0) return null;
 
@@ -657,6 +712,18 @@ export function isPaymentPartiallyPaid(payment: Payment): boolean {
 
 export function isPaymentFullyPaid(payment: Payment): boolean {
   return payment.isPaid || (payment.amountPaid ?? 0) >= payment.amountDue;
+}
+
+/**
+ * Whether a settlement was recorded on this row: the green settled flag
+ * (`status = 'paid'`) OR an adjusted balance (`amount_paid > 0`). Such rows
+ * are IMMUTABLE — no recalculation, reconcile pass, page reload or manual
+ * "Recalculer les échéances" may reset, re-price or delete them. A settled
+ * month stays settled forever; its credit stays exactly where the parent
+ * put it.
+ */
+export function isSettlementRecorded(payment: Payment): boolean {
+  return payment.isPaid || (payment.amountPaid ?? 0) > 0;
 }
 
 /**
@@ -981,6 +1048,10 @@ export function reconcileRuleALedger(
     const keeper = group.rows.reduce((best, p) =>
       isMoreSettledPayment(p, best) ? p : best,
     );
+    // SETTLEMENT PROTECTION: a month whose keeper carries a recorded
+    // settlement (status = 'paid' or amount_paid > 0) is immutable — never
+    // re-priced, re-dated or deleted, even if the engine's expectation moved.
+    if (isSettlementRecorded(keeper)) continue;
     for (const p of group.rows) {
       if (p.id !== keeper.id) del.push(p.id);
     }
@@ -1054,6 +1125,8 @@ export function reconcilePaymentAmounts(
     const keeper = group.rows.reduce((best, p) =>
       isMoreSettledPayment(p, best) ? p : best,
     );
+    // SETTLEMENT PROTECTION — a recorded settlement is never re-priced.
+    if (isSettlementRecorded(keeper)) continue;
     const expectedDueDate =
       computeExpectedMonthDueDate(inputs.billingStart, group.month) ??
       keeper.dueDate;
@@ -1106,6 +1179,31 @@ export interface RecalculateResult {
   remainingCredit: number;
 }
 
+/** Total recorded `amount_paid` across a set of rows. */
+function creditOf(rows: Payment[]): number {
+  return rows.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0);
+}
+
+/**
+ * The not-billable-anymore exit: the subject's UNSETTLED rows are deleted and
+ * their credit returns to the wallet, while rows carrying a recorded
+ * settlement are kept verbatim — they are the historical record of what the
+ * parent paid and must never be discarded.
+ */
+function releaseUnsettled(
+  existing: Payment[],
+  student: Student,
+): RecalculateResult {
+  const unsettled = existing.filter((p) => !isSettlementRecorded(p));
+  return {
+    toDelete: unsettled.map((p) => p.id),
+    // Settled rows stay in the ledger untouched — nothing to write.
+    toUpsert: [],
+    // Only the unsettled rows' credit is free to return to the wallet.
+    remainingCredit: creditOf(unsettled) + (student.advanceBalance ?? 0),
+  };
+}
+
 /**
  * Rebuilds ONE student+subject's Rule A ledger against the current state,
  * anchored per-month on the earliest PRESENT attendance of each month
@@ -1116,6 +1214,12 @@ export interface RecalculateResult {
  * Structural No-Loop-Bug: the invoice key is `(studentId, subject, month)`;
  * the rebuild reuses an existing row's id for that month and emits at most
  * one row per key, so a re-mark can never mint a second invoice.
+ *
+ * SETTLEMENT PROTECTION: months whose rows carry a recorded settlement
+ * (`status = 'paid'` or `amount_paid > 0`) are carried through the rebuild
+ * verbatim — their id, amountDue, amountPaid and isPaid flag all survive.
+ * Their credit is excluded from the redistributable pool, so wallet surplus
+ * can only ever land on a month that is not yet settled.
  *
  * Rule B (every 2Bac Small combo) short-circuits to a no-op — its rolling
  * engine ignores attendance entirely. Pure — no React/Zustand.
@@ -1128,18 +1232,13 @@ export function recalculateStudentSubjectLedger(
   const existing = ctx.payments.filter(
     (p) => p.studentId === student.id && p.subject === subject && p.rule === "A",
   );
-  const creditOf = (rows: Payment[]) =>
-    rows.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0);
 
   const enrollment = student.enrollments.find((e) => e.subject === subject);
-  // No enrollment left → the subject isn't billed; its rows are stale and
-  // its paid credit is released to the wallet.
+  // No enrollment left → the subject isn't billed; its UNSETTLED rows are
+  // stale and their credit is released to the wallet. Settled rows are
+  // immutable and stay as the record of what the parent actually paid.
   if (!enrollment) {
-    return {
-      toDelete: existing.map((p) => p.id),
-      toUpsert: [],
-      remainingCredit: creditOf(existing) + (student.advanceBalance ?? 0),
-    };
+    return releaseUnsettled(existing, student);
   }
 
   // Rule B keeps its fixed rolling engine regardless of attendance marks.
@@ -1157,11 +1256,7 @@ export function recalculateStudentSubjectLedger(
   const price = getEffectivePriceFor(student, enrollment, ctx.prices);
   // Price gone entirely (and no customPrice) → nothing to charge.
   if (price === undefined) {
-    return {
-      toDelete: existing.map((p) => p.id),
-      toUpsert: [],
-      remainingCredit: creditOf(existing) + (student.advanceBalance ?? 0),
-    };
+    return releaseUnsettled(existing, student);
   }
 
   const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
@@ -1192,9 +1287,25 @@ export function recalculateStudentSubjectLedger(
     price,
   );
 
-  // Wallet + the subject's own paid credit — pooled, then re-distributed
-  // earliest-first over the rebuilt months.
-  const creditPool = creditOf(existing) + (student.advanceBalance ?? 0);
+  // SETTLEMENT PROTECTION — a month with a recorded settlement (status =
+  // paid or amount_paid > 0) rides through the rebuild VERBATIM: its id,
+  // amountDue, amountPaid and isPaid flag all survive attendance marks,
+  // page reloads and "Recalculer les échéances". Its credit is NOT part of
+  // the redistributable pool — it is already locked onto that month, so the
+  // waterfall can only move credit that is genuinely free (the wallet).
+  const settledByMonth = new Map<string, Payment>();
+  for (const p of existing) {
+    if (!isSettlementRecorded(p)) continue;
+    const current = settledByMonth.get(p.month);
+    if (!current || isMoreSettledPayment(p, current)) settledByMonth.set(p.month, p);
+  }
+
+  // The credit pool that is still free to move: the prepaid wallet plus the
+  // payments on months carrying no settlement (by construction those have
+  // amount_paid = 0, so this is exactly the wallet).
+  const creditPool =
+    creditOf(existing.filter((p) => !settledByMonth.has(p.month))) +
+    (student.advanceBalance ?? 0);
 
   // One representative row per calendar month (the most-settled one) — its
   // id is REUSED for the rebuilt row, so a re-mark never mints a duplicate.
@@ -1204,22 +1315,29 @@ export function recalculateStudentSubjectLedger(
     if (!current || isMoreSettledPayment(p, current)) priorByMonth.set(p.month, p);
   }
 
-  const rebuilt: Payment[] = schedule.map((installment) => {
-    const prior = priorByMonth.get(installment.monthKey);
-    return {
-      id: prior?.id ?? crypto.randomUUID(),
-      studentId: student.id,
-      subject,
-      dueDate: installment.dueDate,
-      month: installment.monthKey,
-      isPaid: false,
-      amountDue: installment.amount,
-      amountPaid: 0,
-      isHalfMonth: false,
-      rule: "A",
-      updatedAt: ctx.updatedAt,
-    };
-  });
+  const rebuilt: Payment[] = [
+    // The settled months ride along untouched — no diff, no write.
+    ...settledByMonth.values(),
+    // Everything else is regenerated from the freshly-computed schedule.
+    ...schedule
+      .filter((installment) => !settledByMonth.has(installment.monthKey))
+      .map((installment) => {
+        const prior = priorByMonth.get(installment.monthKey);
+        return {
+          id: prior?.id ?? crypto.randomUUID(),
+          studentId: student.id,
+          subject,
+          dueDate: installment.dueDate,
+          month: installment.monthKey,
+          isPaid: false,
+          amountDue: installment.amount,
+          amountPaid: 0,
+          isHalfMonth: false,
+          rule: "A" as const,
+          updatedAt: ctx.updatedAt,
+        };
+      }),
+  ];
 
   const { updated, remaining } = applyCreditWaterfall(
     rebuilt,

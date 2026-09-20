@@ -28,6 +28,7 @@ import {
   generateScheduleFor,
   getPaymentRuleFor,
   isMoreSettledPayment,
+  isSettlementRecorded,
   recalculateStudentSubjectLedger,
   reconcileRuleALedger,
   REGISTRATION_FEE_DEFAULT,
@@ -1427,8 +1428,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   /**
    * Manual "recalculate installments" action — deletes every Rule A row and
    * rebuilds it from scratch, keeping Rule B rows untouched. Payment progress
-   * is preserved per (student, subject, month). Callers ask the user to
-   * confirm first — the whole Rule A ledger is rewritten.
+   * is preserved per (student, subject, month). Rows carrying a recorded
+   * settlement (status = 'paid' or amount_paid > 0) are ALSO kept untouched —
+   * a settled month never reverts to red from a recalculation. Callers ask
+   * the user to confirm first — the whole unsettled Rule A ledger is
+   * rewritten.
    */
   regeneratePaymentLedger: async () => {
     if (!get().hasSyncedPayments) return false;
@@ -1436,8 +1440,22 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const previousPayments = get().payments;
     const previousStudents = get().students;
 
-    const keptPayments = previousPayments.filter((p) => p.rule !== "A");
-    const deletedRuleA = previousPayments.filter((p) => p.rule === "A");
+    // SETTLEMENT PROTECTION — the months carrying a recorded settlement are
+    // kept verbatim (they join `existingKeys` below, so the generator skips
+    // them and can never mint a duplicate for that month).
+    const ruleAMonthKey = (p: Payment) =>
+      `${p.studentId}__${p.subject}__${p.month}`;
+    const settledRuleA = new Set<string>();
+    for (const p of previousPayments) {
+      if (p.rule === "A" && isSettlementRecorded(p)) settledRuleA.add(ruleAMonthKey(p));
+    }
+
+    const keptPayments = previousPayments.filter(
+      (p) => p.rule !== "A" || settledRuleA.has(ruleAMonthKey(p)),
+    );
+    const deletedRuleA = previousPayments.filter(
+      (p) => p.rule === "A" && !settledRuleA.has(ruleAMonthKey(p)),
+    );
 
     // Paid progress per (student, subject, month), so a rebuilt row for the
     // same month keeps what was already paid on the deleted rows.
