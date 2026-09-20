@@ -127,6 +127,11 @@ vi.mock("@/lib/dbServices", () => ({
   deletePaymentsBatchDoc: vi.fn().mockResolvedValue(undefined),
   upsertMessageDoc: vi.fn().mockResolvedValue(undefined),
   deleteMessageDoc: vi.fn().mockResolvedValue(undefined),
+  fetchAllStudents: vi.fn().mockResolvedValue([]),
+  fetchAllSessions: vi.fn().mockResolvedValue([]),
+  fetchAllAttendance: vi.fn().mockResolvedValue([]),
+  fetchAllPrices: vi.fn().mockResolvedValue([]),
+  fetchAllPayments: vi.fn().mockResolvedValue([]),
 }));
 
 const toast = vi.hoisted(() => ({
@@ -150,6 +155,9 @@ function resetStore() {
     hasSyncedPayments: false,
     hasSyncedStudents: false,
     hasSyncedSessions: false,
+    hasSyncedAttendance: false,
+    hasSyncedPrices: false,
+    isDataReady: false,
   });
   mockState.failNextPaymentBatch = false;
   toast.success.mockClear();
@@ -170,6 +178,7 @@ function seedRuleALedger(payments: Payment[], advanceBalance = 0) {
     prices: PRICES,
     payments,
     hasSyncedPayments: true,
+    isDataReady: true,
     lastPaymentsSyncDateKey: TODAY_KEY,
   });
 }
@@ -283,6 +292,9 @@ describe("reactive ledger — markAttendance trigger", () => {
       prices: PRICES,
       payments: [], // nothing generated yet
       hasSyncedPayments: false, // the old gate
+      // The atomic hydration barrier has flipped — the reactive recalc is
+      // gated on `isDataReady`, NOT on hasSyncedPayments.
+      isDataReady: true,
     });
 
     const ok = await useEnnajdState
@@ -549,6 +561,7 @@ describe("reactive ledger — markAttendance trigger", () => {
         payment("b-dec", "2026-12-15", 500, "B"),
       ],
       hasSyncedPayments: true,
+      isDataReady: true,
       lastPaymentsSyncDateKey: TODAY_KEY,
     });
 
@@ -807,6 +820,7 @@ function seedCrossSubjectLedger(payments: Payment[]) {
     prices: [...PRICES, PRICE_PC],
     payments,
     hasSyncedPayments: true,
+    isDataReady: true,
     lastPaymentsSyncDateKey: TODAY_KEY,
   });
 }
@@ -944,6 +958,7 @@ function seedWalletLedger(payments: Payment[], advanceBalance: number) {
     prices: [PRICE_2BAC],
     payments,
     hasSyncedPayments: true,
+    isDataReady: true,
     // null so the once-per-calendar-day guard lets this sync run.
     lastPaymentsSyncDateKey: null,
   });

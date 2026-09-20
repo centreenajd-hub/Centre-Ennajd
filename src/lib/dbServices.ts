@@ -144,6 +144,7 @@ export function deleteStudentDoc(id: string): Promise<void> {
 
 export function subscribeToStudents(
   callback: (students: Student[]) => void,
+  options?: { initialFetch?: boolean },
 ): () => void {
   const channel: RealtimeChannel = supabase
     .channel("students-changes")
@@ -158,15 +159,19 @@ export function subscribeToStudents(
     )
     .subscribe();
 
-  // Initial load
-  fetchAllStudents().then(callback).catch(console.error);
+  // Initial load — skipped when the caller drives the initial hydration
+  // atomically (see `hydrateInitialData` in the store) so the unified
+  // `isDataReady` barrier is the ONLY initial-load path.
+  if (options?.initialFetch ?? true) {
+    fetchAllStudents().then(callback).catch(console.error);
+  }
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
 
-async function fetchAllStudents(): Promise<Student[]> {
+export async function fetchAllStudents(): Promise<Student[]> {
   const { data, error } = await supabase
     .from("students")
     .select("*")
@@ -220,6 +225,7 @@ export function deleteSessionDoc(id: string): Promise<void> {
 
 export function subscribeToSessions(
   callback: (sessions: Session[]) => void,
+  options?: { initialFetch?: boolean },
 ): () => void {
   const channel: RealtimeChannel = supabase
     .channel("sessions-changes")
@@ -232,14 +238,16 @@ export function subscribeToSessions(
     )
     .subscribe();
 
-  fetchAllSessions().then(callback).catch(console.error);
+  if (options?.initialFetch ?? true) {
+    fetchAllSessions().then(callback).catch(console.error);
+  }
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
 
-async function fetchAllSessions(): Promise<Session[]> {
+export async function fetchAllSessions(): Promise<Session[]> {
   const { data, error } = await supabase.from("sessions").select("*");
   assertNoError(error);
   return (data ?? []).map(rowToSession);
@@ -255,6 +263,7 @@ export function setPriceDoc(entry: PriceEntry): Promise<void> {
 
 export function subscribeToPrices(
   callback: (prices: PriceEntry[]) => void,
+  options?: { initialFetch?: boolean },
 ): () => void {
   const channel: RealtimeChannel = supabase
     .channel("prices-changes")
@@ -267,14 +276,16 @@ export function subscribeToPrices(
     )
     .subscribe();
 
-  fetchAllPrices().then(callback).catch(console.error);
+  if (options?.initialFetch ?? true) {
+    fetchAllPrices().then(callback).catch(console.error);
+  }
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
 
-async function fetchAllPrices(): Promise<PriceEntry[]> {
+export async function fetchAllPrices(): Promise<PriceEntry[]> {
   const { data, error } = await supabase.from("prices").select("*");
   assertNoError(error);
   return (data ?? []).map(rowToPrice);
@@ -304,6 +315,7 @@ export async function upsertAttendanceBatchDoc(
 
 export function subscribeToAttendance(
   callback: (records: AttendanceRecord[]) => void,
+  options?: { initialFetch?: boolean },
 ): () => void {
   const channel: RealtimeChannel = supabase
     .channel("attendance-changes")
@@ -316,14 +328,16 @@ export function subscribeToAttendance(
     )
     .subscribe();
 
-  fetchAllAttendance().then(callback).catch(console.error);
+  if (options?.initialFetch ?? true) {
+    fetchAllAttendance().then(callback).catch(console.error);
+  }
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
 
-async function fetchAllAttendance(): Promise<AttendanceRecord[]> {
+export async function fetchAllAttendance(): Promise<AttendanceRecord[]> {
   const { data, error } = await supabase
     .from("attendance_records")
     .select("*");
@@ -423,6 +437,7 @@ export async function deletePaymentsBatchDoc(ids: string[]): Promise<void> {
 
 export function subscribeToPayments(
   callback: (payments: Payment[]) => void,
+  options?: { initialFetch?: boolean },
 ): () => void {
   const channel: RealtimeChannel = supabase
     .channel("payments-changes")
@@ -435,14 +450,16 @@ export function subscribeToPayments(
     )
     .subscribe();
 
-  fetchAllPayments().then(callback).catch(console.error);
+  if (options?.initialFetch ?? true) {
+    fetchAllPayments().then(callback).catch(console.error);
+  }
 
   return () => {
     supabase.removeChannel(channel);
   };
 }
 
-async function fetchAllPayments(): Promise<Payment[]> {
+export async function fetchAllPayments(): Promise<Payment[]> {
   const { data, error } = await supabase.from("payments").select("*");
   assertNoError(error);
   return (data ?? []).map(rowToPayment);

@@ -48,6 +48,11 @@ import {
   deletePaymentsBatchDoc,
   deleteSessionDoc,
   deleteStudentDoc,
+  fetchAllAttendance,
+  fetchAllPayments,
+  fetchAllPrices,
+  fetchAllSessions,
+  fetchAllStudents,
   markAttendanceDoc,
   setPaymentPaidDoc,
   setPriceDoc,
@@ -186,6 +191,17 @@ interface EnnajdState {
   hasSyncedPayments: boolean;
   hasSyncedStudents: boolean;
   hasSyncedSessions: boolean;
+  hasSyncedAttendance: boolean;
+  hasSyncedPrices: boolean;
+  /**
+   * STRICT HYDRATION BARRIER — true ONLY after the four billing-critical
+   * datasets (students, sessions, attendance, prices, payments) have ALL
+   * been fetched atomically and hydrated into the store. Until it flips,
+   * no ledger generation / recalculation pass may run and the UI must show
+   * a loading state instead of zeroed cells. This is what kills the
+   * refresh race: calculations can no longer observe a half-empty store.
+   */
+  isDataReady: boolean;
 
   addStudent: (
     student: Omit<Student, "id" | "createdAt">,
@@ -265,6 +281,14 @@ interface EnnajdState {
   deleteMessage: (id: string) => Promise<boolean>;
 
   hydrateStudents: (students: Student[]) => void;
+  /**
+   * The single atomic initial-load entry point — fires ALL billing-critical
+   * fetches in ONE `Promise.allSettled` and flips `isDataReady` only when
+   * every dataset has settled. Called once per page load by
+   * `useFirestoreSync()` (the realtime subscriptions are attached with
+   * `initialFetch: false` so this is the ONLY initial-load path).
+   */
+  hydrateInitialData: () => Promise<void>;
   hydrateSessions: (sessions: Session[]) => void;
   hydratePrices: (prices: PriceEntry[]) => void;
   hydrateAttendance: (records: AttendanceRecord[]) => void;
@@ -574,6 +598,9 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   hasSyncedPayments: false,
   hasSyncedStudents: false,
   hasSyncedSessions: false,
+  hasSyncedAttendance: false,
+  hasSyncedPrices: false,
+  isDataReady: false,
 
   addStudent: async (student) => {
     const createdAt = new Date().toISOString();
@@ -907,6 +934,13 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     // Guards run BEFORE the throttle is consumed, so an early bail (not yet
     // hydrated / no students) does not block a later deferred retry.
 
+    // HYDRATION BARRIER: never generate installments before the atomic
+    // initial load has settled ALL billing datasets. Generating against a
+    // half-hydrated store (students present but tariffs/attendance still
+    // empty) computed a schedule from `[]` and could overwrite valid stored
+    // rows with a prorated 0-MAD ledger — the refresh blank-state bug.
+    if (!get().isDataReady) return;
+
     // NEVER generate before the payments listener has hydrated at least once.
     // On a fresh page load the local `payments` array is empty while the
     // snapshot that fills it arrives asynchronously — later than a
@@ -1120,6 +1154,14 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
    * no-op. Failures revert + warn and never block the attendance write.
    */
   recalculatePaymentsForStudentSubject: async (studentId, subject) => {
+    // HYDRATION BARRIER: an attendance mark landed before the atomic initial
+    // load finished. Recomputing a Rule A ledger now would read a store whose
+    // attendance/sessions/prices slices may still be empty and rebuild months
+    // from `[]`. The attendance write itself already persisted; once
+    // `isDataReady` flips, `maybeRunPaymentSync` regenerates from the complete
+    // dataset. Every later mark recalculates immediately as before.
+    if (!get().isDataReady) return;
+
     const student = get().students.find((s) => s.id === studentId);
     if (!student) return;
 
@@ -1435,6 +1477,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
    * rewritten.
    */
   regeneratePaymentLedger: async () => {
+    // Manual full rebuild — refuse to run against a half-hydrated store.
+    if (!get().isDataReady) return false;
     if (!get().hasSyncedPayments) return false;
 
     const previousPayments = get().payments;
@@ -1690,6 +1734,74 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     );
   },
 
+  /**
+   * ATOMIC UNIFIED HYDRATION BARRIER.
+   *
+   * On a browser refresh the six realtime subscriptions each resolved their
+   * own initial fetch independently and in unpredictable order. Whichever
+   * slice landed last re-rendered the reports, so `buildPaymentMatrix` /
+   * `reconcileRuleALedger` regularly observed a HALF-EMPTY store — payments
+   * present but students missing, or attendance present but tariffs missing —
+   * and rendered blank rows / 0 MAD. Worse, `syncPayments` could start
+   * generating installments against a roster or price table that was still
+   * empty.
+   *
+   * This collapses ALL initial fetches into ONE `Promise.allSettled`. Not one
+   * dataset is written to the store until every dataset has settled, and only
+   * then does `isDataReady` flip — the gate every calculation pass and the
+   * report UI check before touching a single row. `allSettled` (not `all`) so
+   * one failing table can never leave the app stuck on a skeleton forever; a
+   * rejection hydrates that slice as `[]` and is logged, exactly like the
+   * previous per-subscription `.catch(console.error)` behaviour.
+   *
+   * Idempotent: a second call while `isDataReady` is already true is a no-op
+   * (the realtime listeners re-hydrate on remote changes afterwards).
+   */
+  hydrateInitialData: async () => {
+    if (get().isDataReady) return;
+
+    const results = await Promise.allSettled([
+      fetchAllStudents(),
+      fetchAllSessions(),
+      fetchAllAttendance(),
+      fetchAllPrices(),
+      fetchAllPayments(),
+    ]);
+
+    const settled = <T>(r: PromiseSettledResult<T[]>, label: string): T[] => {
+      if (r.status === "rejected") {
+        console.error(`[ennajd] initial fetch of ${label} failed:`, r.reason);
+        return [];
+      }
+      return r.value;
+    };
+
+    const [
+      studentsResult,
+      sessionsResult,
+      attendanceResult,
+      pricesResult,
+      paymentsResult,
+    ] = results;
+
+    // Apply every slice in the SAME tick via the shared hydrate actions
+    // (they keep the normalization + dedupe self-heal). `maybeRunPaymentSync`
+    // is still gated on `isDataReady` during these calls, so no generation
+    // starts against a partial store.
+    get().hydrateStudents(settled(studentsResult, "students"));
+    get().hydrateSessions(settled(sessionsResult, "sessions"));
+    get().hydrateAttendance(settled(attendanceResult, "attendance"));
+    get().hydratePrices(settled(pricesResult, "prices"));
+    get().hydratePayments(settled(paymentsResult, "payments"));
+
+    // Flip the barrier in a single write — from this moment on every
+    // subscriber sees a store whose billing datasets are all present.
+    set({ isDataReady: true });
+
+    // Now (and only now) the ledger may be generated.
+    maybeRunPaymentSync();
+  },
+
   hydrateStudents: (students) => {
     // Materialize advanceBalance (default 0) for legacy students who predate
     // the `advance_balance` column — prevents undefined/NaN in downstream
@@ -1714,11 +1826,15 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   },
   hydratePrices: (prices) => {
     const next = replaceIfChanged(get().prices, prices);
-    if (next) set({ prices: next });
+    const hasSynced = get().hasSyncedPrices;
+    if (next) set({ prices: next, hasSyncedPrices: true });
+    else if (!hasSynced) set({ hasSyncedPrices: true });
   },
   hydrateAttendance: (records) => {
     const next = replaceIfChanged(get().attendanceRecords, records);
-    if (next) set({ attendanceRecords: next });
+    const hasSynced = get().hasSyncedAttendance;
+    if (next) set({ attendanceRecords: next, hasSyncedAttendance: true });
+    else if (!hasSynced) set({ hasSyncedAttendance: true });
   },
   hydratePayments: (payments) => {
     // Self-heal: collapse duplicate rows that share a logical installment
@@ -1751,6 +1867,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
  */
 function maybeRunPaymentSync(): void {
   const state = useEnnajdState.getState();
-  if (!state.hasSyncedPayments || state.students.length === 0) return;
+  // The atomic hydration barrier must have flipped AND the authoritative
+  // ledger + roster must be present. `syncPayments` re-checks both, so this
+  // is a cheap no-op whenever there is nothing to generate.
+  if (!state.isDataReady || !state.hasSyncedPayments || state.students.length === 0) {
+    return;
+  }
   void state.syncPayments(new Date());
 }

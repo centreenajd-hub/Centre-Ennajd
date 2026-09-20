@@ -6,6 +6,7 @@ import { IncludedSessionsNote } from "@/components/reports/IncludedSessionsNote"
 import { LevelStep } from "@/components/reports/LevelStep";
 import { MonthYearPicker } from "@/components/reports/MonthYearPicker";
 import { PaymentsPreviewTable } from "@/components/reports/PaymentsPreviewTable";
+import { ReportDataSkeleton } from "@/components/reports/ReportDataSkeleton";
 import { ReportTypeAndExportCard } from "@/components/reports/ReportTypeAndExportCard";
 import { SubjectStep } from "@/components/reports/SubjectStep";
 import { TrackAndGroupStep } from "@/components/reports/TrackAndGroupStep";
@@ -39,6 +40,10 @@ export function ReportGenerator() {
   const attendanceRecords = useEnnajdState((s) => s.attendanceRecords);
   const payments = useEnnajdState((s) => s.payments);
   const getBasePrice = useEnnajdState((s) => s.getBasePrice);
+  // HYDRATION BARRIER — stays false until the atomic initial load has
+  // settled every billing dataset. The tables render a skeleton (not
+  // zeroed cells) while the queries are in flight.
+  const isDataReady = useEnnajdState((s) => s.isDataReady);
 
   const [level, setLevel] = useState<Level | null>(null);
   const [track, setTrack] = useState<Track | null>(null);
@@ -133,7 +138,8 @@ export function ReportGenerator() {
     );
   }, [scope, subject, students, payments, academicMonths, basePrice, attendanceRecords, todayKey]);
 
-  const canGenerate = (attendanceChecked || paymentsChecked) && roster.length > 0;
+  const canGenerate =
+    (attendanceChecked || paymentsChecked) && roster.length > 0 && isDataReady;
 
   async function handleGenerate() {
     if (!scope || !level || !subject) return;
@@ -217,7 +223,9 @@ export function ReportGenerator() {
               isGenerating={isGenerating}
             />
 
-            {roster.length === 0 ? (
+            {!isDataReady ? (
+              <ReportDataSkeleton />
+            ) : roster.length === 0 ? (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-card/50 py-16 text-center text-muted-foreground">
                 {t("noEnrolledStudents")}
               </div>
