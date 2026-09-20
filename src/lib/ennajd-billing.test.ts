@@ -18,11 +18,13 @@ import {
   getFixedSessionCount,
   getPaymentRemaining,
   getPaymentRuleFor,
+  getPaymentsToReceive,
   getStandardSessionCount,
   isPaymentFullyPaid,
   recalculateStudentSubjectLedger,
   reconcilePaymentAmounts,
   reconcileRuleALedger,
+  roundMAD,
   type RecalculateResult,
 } from "./ennajd-billing";
 import type {
@@ -1759,5 +1761,123 @@ describe("recalculateStudentSubjectLedger", () => {
       expect(result.toUpsert).toEqual([]);
       expect(result.remainingCredit).toBe(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// roundMAD — the integer contract (no decimals ever reach a parent)
+// ---------------------------------------------------------------------------
+
+describe("roundMAD — smart rounding", () => {
+  it("rounds a fractional session cost to a clean whole MAD", () => {
+    // The spec example: 5 × 43.75 = 218.75 → 219.
+    expect(roundMAD(5 * (350 / 8))).toBe(219);
+    expect(roundMAD(218.75)).toBe(219);
+    expect(roundMAD(218.4)).toBe(218);
+  });
+
+  it("leaves whole amounts untouched and never returns a fraction", () => {
+    expect(roundMAD(350)).toBe(350);
+    expect(roundMAD(0)).toBe(0);
+    expect(Number.isInteger(roundMAD(131.25))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getPaymentsToReceive — the "Paiements à recevoir" worklist: one row per
+// student + subject with the CLEAN INTEGER complement to reach the full
+// monthly_price, plus the credit already carried onto that month.
+// ---------------------------------------------------------------------------
+
+describe("getPaymentsToReceive — clean complement worklist", () => {
+  const TODAY = "2026-10-15";
+  const PRICE = 350;
+
+  function specStudent(): Student {
+    return makeStudent({
+      id: STUDENT_ID,
+      enrollments: [
+        {
+          subject: "Math",
+          track: null,
+          groupType: "Large",
+          enrolledAt: "2026-09-15T00:00:00.000Z",
+        },
+      ],
+    });
+  }
+
+  it("(spec example) reports a clean 219 MAD complement on Month 2 with 131 carried credit", () => {
+    // Month 1 = 219 (5/8 × 350 rounded) settled; Month 2 = 350 carrying the
+    // 131 surplus → the parent's next collection is exactly 219, an integer.
+    const payments: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219, 219, true),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 131, false),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row.studentName).toBe("Test Student");
+    expect(row.subject).toBe("Math");
+    expect(row.monthlyPrice).toBe(350);
+    expect(row.creditCarried).toBe(131);
+    expect(row.complement).toBe(219);
+    expect(Number.isInteger(row.complement)).toBe(true);
+    expect(row.isOverdue).toBe(true); // due 2026-10-01 < TODAY 2026-10-15
+  });
+
+  it("flags overdue months and drops fully-covered ones", () => {
+    const payments: Payment[] = [
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+      makePayment("nov", STUDENT_ID, "Math", "2026-11-01", 350, 350, true),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].paymentId).toBe("oct");
+    expect(rows[0].complement).toBe(350);
+    expect(rows[0].isOverdue).toBe(true);
+  });
+
+  it("keeps only the EARLIEST unpaid month per student + subject", () => {
+    const payments: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-01", 350, 0, false),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].monthKey).toBe("2026-09");
+  });
+
+  it("emits one row per subject and skips students with no doc", () => {
+    const student2 = makeStudent({
+      id: "student-2",
+      enrollments: [
+        {
+          subject: "PC",
+          track: null,
+          groupType: "Large",
+          enrolledAt: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+    });
+    const payments: Payment[] = [
+      makePayment("m1", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+      makePayment("m2", "student-2", "PC", "2026-09-01", 400, 0, false),
+      // Orphan payment (student doc deleted) → dropped.
+      makePayment("m3", "ghost", "SVT", "2026-09-01", 300, 0, false),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent(), student2], TODAY);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.subject)).toEqual(["PC", "Math"]); // date-sorted
+  });
+
+  it("never returns a fractional complement", () => {
+    const payments: Payment[] = [
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 219, 0, false),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].complement).toBe(219);
+    expect(Number.isInteger(rows[0].complement)).toBe(true);
   });
 });

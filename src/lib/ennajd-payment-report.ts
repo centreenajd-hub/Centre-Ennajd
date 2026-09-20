@@ -9,6 +9,7 @@ import {
   buildDeliveredDatesContext,
   computeExpectedMonthAmount,
   earliestValidAttendanceDate,
+  roundMAD,
 } from "@/lib/ennajd-billing";
 import type {
   AttendanceRecord,
@@ -130,9 +131,16 @@ export function buildPaymentMatrix(
         continue;
       }
 
-      const amountDue = monthPayments.reduce((sum, p) => sum + p.amountDue, 0);
-      const amountPaid = monthPayments.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0);
-      const remaining = Math.max(0, amountDue - amountPaid);
+      // Integer contract: the report NEVER shows a fraction. Every figure a
+      // parent sees passes through roundMAD, so a stray fractional price can
+      // never leak into the "Rapport de paiements".
+      const amountDue = roundMAD(
+        monthPayments.reduce((sum, p) => sum + p.amountDue, 0),
+      );
+      const amountPaid = roundMAD(
+        monthPayments.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0),
+      );
+      const remaining = Math.max(0, roundMAD(amountDue - amountPaid));
       // A month is "fully paid" only when every installment is covered —
       // an amountPaid that doesn't reach amountDue keeps it unpaid.
       const isPaid = monthPayments.every(

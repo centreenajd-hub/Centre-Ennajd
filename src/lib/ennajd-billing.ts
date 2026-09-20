@@ -37,6 +37,28 @@ import type {
 export type PaymentRule = "A" | "B";
 
 // ---------------------------------------------------------------------------//
+// The integer contract — every amount shown to a parent or written to
+// Supabase is a clean whole MAD. One helper for the whole engine + UI.
+// ---------------------------------------------------------------------------//
+
+/**
+ * Smart rounding (no decimals): MAD amounts are ALWAYS integers so they are
+ * comfortable to collect from parents. Every `amountDue` / `amountPaid` /
+ * `advanceBalance` / report figure passes through here.
+ *
+ * The Month-2 complement contract:
+ *   raw_month_1   = eligible_sessions × (monthly_price / base_sessions)
+ *   month_2_to_pay = roundMAD(raw_month_1)          ← clean integer
+ *   month_1_due    = monthly_price − month_2_to_pay  ← integer by construction
+ * The engine emits `roundMAD` for each prorated month, and the credit
+ * waterfall carries the surplus forward, so the next month's remaining gap
+ * (`monthly_price − credit_carried`) is itself a clean integer.
+ */
+export function roundMAD(amount: number): number {
+  return Math.round(amount);
+}
+
+// ---------------------------------------------------------------------------//
 // Calendar helpers (local-calendar fields — never UTC, no TZ day-shift bugs)
 // ---------------------------------------------------------------------------//
 
@@ -502,7 +524,8 @@ export function computeMonthInvoice(
   // A lone remaining session in the start month is free.
   if (isStartMonth && billable <= 1) return null;
 
-  return Math.round((price / fixedCount) * billable);
+  // Smart rounding: billable × (price / base_sessions), always an integer.
+  return roundMAD((price / fixedCount) * billable);
 }
 
 /**
@@ -598,7 +621,7 @@ export function generateRuleBSchedule(
     results.push({
       monthKey: formatMonthKey(cursor),
       dueDate: formatDateKey(cursor),
-      amount: Math.round(price),
+      amount: roundMAD(price),
     });
     i += 1;
     cursor = addMonthsClamped(start, i);
@@ -1570,4 +1593,99 @@ export function aggregateRegistrationFeeDebtors(
     count: rows.length,
     totalRemaining: rows.reduce((sum, row) => sum + row.remaining, 0),
   };
+}
+
+// ---------------------------------------------------------------------------//
+// "Paiements à recevoir" — the dashboard alerts worklist. One row per
+// student + subject, carrying the CLEAN INTEGER complement the parent must
+// pay next to bring that month to its full monthly_price.
+// ---------------------------------------------------------------------------//
+
+export interface PaymentToReceiveRow {
+  studentId: string;
+  studentName: string;
+  subject: Subject;
+  /** The installment the complement settles (earliest not-fully-paid). */
+  paymentId: string;
+  monthKey: string;
+  dueDate: string;
+  /** True when the due date has already passed (overdue collection). */
+  isOverdue: boolean;
+  /** Full monthly_price of the target month (integer). */
+  monthlyPrice: number;
+  /** Credit already carried onto that month — `month_1_due` in the spec. */
+  creditCarried: number;
+  /**
+   * The clean complement integer the parent pays for this month to reach
+   * `monthlyPrice`: `roundMAD(monthlyPrice − creditCarried)`. Never a
+   * fraction, by the integer contract.
+   */
+  complement: number;
+}
+
+/**
+ * The dashboard's "Paiements à recevoir" worklist. For every student + subject
+ * with an installment that is not fully paid, the EARLIEST such month becomes
+ * one row carrying:
+ *
+ *   monthlyPrice  — that month's full price (dynamic: the student's own price
+ *                   from the `prices` table / `customPrice`, never a hardcoded
+ *                   350);
+ *   creditCarried — what the wallet already credited to this month (Month 1's
+ *                   carried-over surplus, `month_1_due`);
+ *   complement    — `roundMAD(monthlyPrice − creditCarried)`, the clean whole
+ *                   number to collect from the parent.
+ *
+ * Fully-paid months are skipped (complement 0). Sorted by dueDate, then name,
+ * so the most pressing collection surfaces first. Pure — no React/Zustand.
+ */
+export function getPaymentsToReceive(
+  payments: Payment[],
+  students: Student[],
+  todayKey: string,
+): PaymentToReceiveRow[] {
+  const studentsById = new Map(students.map((s) => [s.id, s]));
+
+  // Earliest not-fully-paid installment per (student, subject).
+  const earliest = new Map<string, Payment>();
+  for (const payment of payments) {
+    if (isPaymentFullyPaid(payment)) continue;
+    if (getPaymentRemaining(payment) <= 0) continue;
+    const key = `${payment.studentId}__${payment.subject}`;
+    const current = earliest.get(key);
+    if (!current || payment.dueDate < current.dueDate) {
+      earliest.set(key, payment);
+    }
+  }
+
+  const rows: PaymentToReceiveRow[] = [];
+  for (const payment of earliest.values()) {
+    const student = studentsById.get(payment.studentId);
+    if (!student) continue;
+    const monthlyPrice = roundMAD(payment.amountDue);
+    const creditCarried = roundMAD(payment.amountPaid ?? 0);
+    const complement = Math.max(0, roundMAD(monthlyPrice - creditCarried));
+    rows.push({
+      studentId: student.id,
+      studentName: `${student.firstName} ${student.lastName}`,
+      subject: payment.subject,
+      paymentId: payment.id,
+      monthKey: payment.month,
+      dueDate: payment.dueDate,
+      isOverdue: payment.dueDate < todayKey,
+      monthlyPrice,
+      creditCarried,
+      complement,
+    });
+  }
+
+  rows.sort((a, b) => {
+    if (a.dueDate !== b.dueDate) return a.dueDate.localeCompare(b.dueDate);
+    return a.studentName.localeCompare(b.studentName);
+  });
+
+  // Drop months whose gap is already covered (complement 0) — they are not a
+  // collection task. Future months are KEPT: this is the collection forecast,
+  // and Month 2's complement is knowable the moment Month 1 is settled.
+  return rows.filter((row) => row.complement > 0);
 }

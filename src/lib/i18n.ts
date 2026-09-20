@@ -415,6 +415,7 @@ const dictionary = {
       "{amount} MAD seront appliqués à la facture du mois prochain",
     advanceBalanceLabel: "Solde d'avance",
     nextDueColumn: "Prochaine échéance",
+    paymentsToReceive: "Paiements à recevoir",
   },
   ar: {
     appName: "مركز النجد",
@@ -815,6 +816,7 @@ const dictionary = {
       "سيتم تطبيق {amount} درهم على فاتورة الشهر القادم",
     advanceBalanceLabel: "الرصيد المتقدّن",
     nextDueColumn: "الاستحقاق الجاي",
+    paymentsToReceive: "المدفوعات المستحقة",
   },
 } satisfies Record<LangCode, Record<string, string>>;
 

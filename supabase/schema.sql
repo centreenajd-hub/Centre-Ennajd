@@ -83,6 +83,12 @@ create table attendance_records (
 -- Create indexes for attendance queries
 create index idx_attendance_student_session_date on attendance_records (student_id, session_id, date);
 
+-- Attendance lists + the billing anchor (a student's first PRESENT mark):
+-- the monthly attendance report and the reactive ledger recalc both filter
+-- by student then date, so this makes them index-only scans.
+create index idx_attendance_student_date on attendance_records (student_id, date);
+create index idx_attendance_student_status on attendance_records (student_id, status);
+
 -- ============================================================================
 -- PAYMENTS TABLE
 -- ============================================================================
@@ -105,6 +111,12 @@ create table payments (
 -- Create indexes for payment queries
 create index idx_payments_student_subject_due on payments (student_id, subject, due_date);
 create index idx_payments_due_date on payments (due_date);
+
+-- Collection forecast + report lookups: "what does this student owe this
+-- month for this subject" is a single index seek (no seq scan on the free
+-- tier). Covers the "Paiements à recevoir" worklist and the report matrix.
+create index idx_payments_student_month_subject on payments (student_id, month, subject);
+create index idx_payments_subject_month on payments (subject, month);
 
 -- Create index for rule filtering
 create index idx_payments_rule on payments (rule);
