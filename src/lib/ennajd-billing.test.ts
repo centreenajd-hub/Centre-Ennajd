@@ -25,6 +25,7 @@ import {
   reconcilePaymentAmounts,
   reconcileRuleALedger,
   roundMAD,
+  floorMAD,
   type RecalculateResult,
 } from "./ennajd-billing";
 import type {
@@ -295,10 +296,10 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
     expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(400);
   });
 
-  it("charges full price for complete later months, due on the 1st", () => {
-    // A later month anchors on its own 1st → full month (Rule 2). A mid-month
-    // January start makes February the 100 MAD complement month, so only
-    // March is a later full month here.
+  it("bills complete later months at full price, due on the 1st", () => {
+    // A later month anchors on its own 1st → full month (Rule 2). January is
+    // prorated (300); February is the transition month and bills the FULL
+    // price — its own 4 Wednesdays — and March locks to full price too.
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 15),
       new Date(2025, 2, 15), // through March
@@ -306,28 +307,27 @@ describe("generateSessionBasedSchedule — 1x/week subject (fixedCount = 4)", ()
       PRICE,
     );
     const feb = schedule.find((s) => s.monthKey === "2025-02");
-    expect(feb!.amount).toBe(100); // 400 − 300 (the complement)
+    expect(feb!.amount).toBe(400); // full price, not the 100 remainder
     expect(feb!.dueDate).toBe("2025-02-01");
     const mar = schedule.find((s) => s.monthKey === "2025-03");
     expect(mar!.amount).toBe(400);
     expect(mar!.dueDate).toBe("2025-03-01");
   });
 
-  it("spreads the first monthly price across the start month and its complement", () => {
-    // THE MONTH-2 COMPLEMENT: a mid-month join bills the start month at its
-    // prorated amount (Jan 15 → 3 sessions = 300) and the NEXT month at the
-    // remainder (400 − 300 = 100), so the pair totals exactly one monthly
-    // price. February's own 4 sessions never enter the math.
+  it("bills the start month prorated and the next month at the full price", () => {
+    // THE TWO-MONTH TRANSITIONAL CYCLE: a mid-month join bills the start
+    // month at its floored prorated amount (Jan 15 → 3 sessions = 300) and
+    // the NEXT month at the FULL price (400) — never the remainder. The
+    // enrollment surplus (400 − 300 = 100) rides onto February as carried
+    // credit via applyCreditWaterfall, so the parent's next payment is 300.
     const schedule = generateSessionBasedSchedule(
       new Date(2025, 0, 15),
       new Date(2025, 2, 15),
       WED_CTX,
       PRICE,
     );
-    const total = schedule
-      .filter((s) => s.monthKey === "2025-01" || s.monthKey === "2025-02")
-      .reduce((sum, s) => sum + s.amount, 0);
-    expect(total).toBe(PRICE);
+    expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(300);
+    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
   });
 
   it("emits no installment for months before the billing start", () => {
@@ -429,8 +429,9 @@ describe("generateSessionBasedSchedule — 2x/week subject (fixedCount = 8)", ()
       PRICE_2X,
     );
     expect(schedule.find((s) => s.monthKey === "2025-01")!.amount).toBe(400);
-    // The complement: February carries 800 − 400 = 400.
-    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(400);
+    // February is the transition month: it bills its own full price (8
+    // occurrences → 800), with the 400 enrollment surplus carried onto it.
+    expect(schedule.find((s) => s.monthKey === "2025-02")!.amount).toBe(800);
   });
 
   it("caps a 9-occurrence month at 8 (full price)", () => {
@@ -478,33 +479,33 @@ describe("computeMonthInvoice", () => {
     ).toBe(computeMonthInvoice(new Date(2025, 0, 21), "2025-01", WED_CTX, PRICE));
   });
 
-  it("bills the complement on the month right after a partial start month", () => {
-    // Jan 21 → 2 sessions = 200; February carries the 200 complement. The
-    // pair totals exactly one monthly price (400).
+  it("bills the month right after a partial start month at the full price", () => {
+    // Jan 21 → 2 sessions = 200; February is the transition month and bills
+    // the FULL price (its own 4 Wednesdays), never the remainder.
     const start = new Date(2025, 0, 21);
     expect(computeMonthInvoice(start, "2025-01", WED_CTX, PRICE)).toBe(200);
-    expect(computeMonthInvoice(start, "2025-02", WED_CTX, PRICE)).toBe(200);
+    expect(computeMonthInvoice(start, "2025-02", WED_CTX, PRICE)).toBe(400);
     expect(computeMonthInvoice(start, "2025-03", WED_CTX, PRICE)).toBe(400);
   });
 
-  it("bills no complement when the start month is already full", () => {
+  it("bills no transition surcharge when the start month is already full", () => {
     // Jan 1 (a Wednesday) → 4 billable = the full price, so there is no
-    // remainder to carry and February is the standard full price too.
+    // surplus to carry and February is the standard full price too.
     const start = new Date(2025, 0, 1);
     expect(computeMonthInvoice(start, "2025-01", WED_CTX, PRICE)).toBe(400);
     expect(computeMonthInvoice(start, "2025-02", WED_CTX, PRICE)).toBe(400);
   });
 
-  it("computeExpectedMonthAmount mirrors computeMonthInvoice for the complement month", () => {
+  it("computeExpectedMonthAmount mirrors computeMonthInvoice for the transition month", () => {
     const start = new Date(2025, 0, 21);
     expect(computeExpectedMonthAmount(start, "2025-02", WED_CTX, PRICE)).toBe(
       computeMonthInvoice(start, "2025-02", WED_CTX, PRICE),
     );
   });
 
-  it("never bills the complement on a month that is not billable (gap month)", () => {
+  it("never bills a non-billable month (gap month) even after a partial start", () => {
     // January is partial (300) but February is a GAP month — the combo
-    // delivers nothing then, so it inherits no complement and bills nothing.
+    // delivers nothing then, so it bills nothing and the surplus carries on.
     const ctx = makeCtx({
       scheduledDaysOfWeek: [3],
       gapMonthKeys: new Set(["2025-02"]),
@@ -536,34 +537,41 @@ describe("computeMonthInvoice", () => {
 });
 
 // ---------------------------------------------------------------------------//
-// The 450 MAD spec example — a partial September spreads its remainder onto
-// October: Sept 394 + Oct 56 = exactly one monthly price.
+// The 450 MAD spec example — a partial September is FLOORED to 393 (never
+// rounded up) and October is the full-price transition month carrying the
+// 57 credit: the parent's next payment is exactly 393.
 // ---------------------------------------------------------------------------//
 
-describe("Spec contract — the 450 MAD example (Sept 394 + Oct 56)", () => {
+describe("Spec contract — the 450 MAD example (Sept 393 floored + Oct 450)", () => {
   const ctx = makeCtx({ scheduledDaysOfWeek: [2, 4] }); // Mardi + Jeudi → 8/month
   const PRICE_450 = 450;
   // Sept 2026: Tue 1, 8, 15, 22, 29 + Thu 3, 10, 17, 24 = 9 occurrences.
-  // A Sept 8 anchor leaves exactly 7 → 7 × 56.25 = 393.75 → 394.
+  // A Sept 8 anchor leaves exactly 7 → 7 × 56.25 = 393.75 → FLOORED to 393.
+  // A 450 enrollment payment settles Sept at 393 and carries 57 onto October,
+  // so the parent's next payment is 450 − 57 = 393.
   const START = new Date(2026, 8, 8);
 
-  it("bills September at 394 and October at the 56 complement", () => {
-    expect(computeMonthInvoice(START, "2026-09", ctx, PRICE_450)).toBe(394);
-    expect(computeMonthInvoice(START, "2026-10", ctx, PRICE_450)).toBe(56);
+  it("bills September at the FLOORED 393 and October at the full 450", () => {
+    expect(computeMonthInvoice(START, "2026-09", ctx, PRICE_450)).toBe(393);
+    expect(computeMonthInvoice(START, "2026-10", ctx, PRICE_450)).toBe(450);
     expect(computeMonthInvoice(START, "2026-11", ctx, PRICE_450)).toBe(450);
   });
 
-  it("spreads exactly one monthly price across the pair in the schedule", () => {
+  it("never rounds a fractional month up — the floor favors the parent", () => {
+    expect(computeMonthInvoice(START, "2026-09", ctx, PRICE_450)).toBe(393);
+    expect(computeMonthInvoice(START, "2026-09", ctx, PRICE_450)).not.toBe(394);
+  });
+
+  it("bills the start month floored and the next month at full price in the schedule", () => {
     const schedule = generateSessionBasedSchedule(
       START,
       new Date(2026, 10, 15),
       ctx,
       PRICE_450,
     );
-    const pair = schedule.filter(
-      (s) => s.monthKey === "2026-09" || s.monthKey === "2026-10",
-    );
-    expect(pair.reduce((sum, s) => sum + s.amount, 0)).toBe(PRICE_450);
+    expect(schedule.find((s) => s.monthKey === "2026-09")!.amount).toBe(393);
+    expect(schedule.find((s) => s.monthKey === "2026-10")!.amount).toBe(450);
+    expect(schedule.find((s) => s.monthKey === "2026-11")!.amount).toBe(450);
   });
 });
 
@@ -911,11 +919,11 @@ describe("applyCreditWaterfall", () => {
 // Rule A carryover contract — surplus beyond the prorated first month lands
 // on the next month as partial credit (green), and any remainder parks in
 // advance_balance. amountDue values mirror the engine's dynamic output for
-// a 350 DH subject joined mid-month (219 = 5/8 prorated first month).
+// a 350 DH subject joined mid-month (218 = 5/8 prorated, floored).
 // ---------------------------------------------------------------------------
 
 describe("applyCreditWaterfall — Rule A carryover contract", () => {
-  const PRORATED_FIRST = 219; // 5 × 43.75
+  const PRORATED_FIRST = 218; // 5 × 43.75 = 218.75 → FLOORED (never 219)
   const FULL_MONTH = 350;
 
   function specPayments(): Payment[] {
@@ -927,7 +935,7 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
   }
 
   it("(a) surplus beyond the prorated first month lands on the next month as partial credit, and any remainder parks as advance_balance", () => {
-    // 400 − 219 = 181 surplus → October is PARTIALLY PAID (green chip),
+    // 400 − 218 = 182 surplus → October is PARTIALLY PAID (green chip),
     // wallet exhausted, nothing parks.
     const partial = applyCreditWaterfall(
       specPayments(),
@@ -940,17 +948,17 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
     const byId = new Map(partial.updated.map((p) => [p.id, p]));
     expect(byId.get("sept")!.amountPaid).toBe(PRORATED_FIRST);
     expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(true);
-    expect(byId.get("oct")!.amountPaid).toBe(181); // green advance credit
+    expect(byId.get("oct")!.amountPaid).toBe(182); // green advance credit
     expect(byId.get("oct")!.isPaid).toBe(false);
     expect(byId.get("nov")).toBeUndefined(); // wallet dry
     expect(partial.remaining).toBe(0); // advance_balance untouched
 
-    // 619 = 219 + 350 + 50 → Sept & Oct fully paid, Nov partial, nothing parks.
+    // 618 = 218 + 350 + 50 → Sept & Oct fully paid, Nov partial, nothing parks.
     const threeWay = applyCreditWaterfall(
       specPayments(),
       STUDENT_ID,
       "Math",
-      619,
+      618,
       "2026-09-30",
       NOW,
     );
@@ -961,7 +969,7 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
     expect(byId3.get("nov")!.isPaid).toBe(false);
     expect(threeWay.remaining).toBe(0);
 
-    // 1000 covers every gap with 81 left over → the remainder parks in
+    // 1000 covers every gap with 82 left over → the remainder parks in
     // advance_balance (returned as `remaining` for the caller to store).
     const surplus = applyCreditWaterfall(
       specPayments(),
@@ -972,11 +980,11 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
       NOW,
     );
     expect(surplus.updated.every(isPaymentFullyPaid)).toBe(true);
-    expect(surplus.remaining).toBe(1000 - PRORATED_FIRST - 2 * FULL_MONTH); // 81
+    expect(surplus.remaining).toBe(1000 - PRORATED_FIRST - 2 * FULL_MONTH); // 82
   });
 
   it("(b) a wallet exactly covering multiple months leaves them fully paid with zero remainder", () => {
-    const exact = PRORATED_FIRST + 2 * FULL_MONTH; // 919
+    const exact = PRORATED_FIRST + 2 * FULL_MONTH; // 918
     const result = applyCreditWaterfall(
       specPayments(),
       STUDENT_ID,
@@ -993,7 +1001,7 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
   });
 
   it("(c) a wallet fully absorbed by the first gap leaves advance_balance at 0", () => {
-    // 100 < 219 → September is partially paid and the wallet hits 0, so
+    // 100 < 218 → September is partially paid and the wallet hits 0, so
     // nothing parks and later months are untouched.
     const result = applyCreditWaterfall(
       specPayments(),
@@ -1493,18 +1501,18 @@ describe("reconcileRuleALedger", () => {
 // Spec regression — T.C Math 350 DH · Mardi+Jeudi 19:00 · enrolled 2026-09-15
 // ---------------------------------------------------------------------------//
 // Sept 2026: Tuesdays 1, 8, 15, 22, 29 (5) + Thursdays 3, 10, 17, 24 (4).
-// fixedCount = 8, perSession = 350 / 8 = 43.75.
-//   billing start 15/09 (no attendance)     → 5 sessions → 219 DH
-//   attendance anchor 17/09                  → 4 sessions → 175 DH
-//   attendance anchor 10/09 (pre-registration) → 6 sessions → 263 DH
-//   attendance anchor 08/09                  → 7 sessions → 306 DH
+// fixedCount = 8, perSession = 350 / 8 = 43.75. Month dues are FLOORED:
+//   billing start 15/09 (no attendance)     → 5 sessions → 218 DH (218.75 floored)
+//   attendance anchor 17/09                  → 4 sessions → 175 DH (exact)
+//   attendance anchor 10/09 (pre-registration) → 6 sessions → 262 DH (262.5 floored)
+//   attendance anchor 08/09                  → 7 sessions → 306 DH (306.25 floored)
 
 describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15", () => {
   const TUE_THU_CTX = makeCtx({ scheduledDaysOfWeek: [2, 4] }); // Mardi + Jeudi
   const PRICE_350 = 350;
   const ENROLLED = new Date(2026, 8, 15); // 2026-09-15 (Tuesday)
 
-  it("bills Sept 2026 at 219 DH (5 sessions × 43.75), due on the start date", () => {
+  it("bills Sept 2026 at the FLOORED 218 DH (5 × 43.75 = 218.75), due on the start date", () => {
     expect(getFixedSessionCount(TUE_THU_CTX)).toBe(8);
     const schedule = generateSessionBasedSchedule(
       ENROLLED,
@@ -1514,7 +1522,7 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
     );
     const sept = schedule.find((s) => s.monthKey === "2026-09");
     expect(sept).toBeDefined();
-    expect(sept!.amount).toBe(219);
+    expect(sept!.amount).toBe(218);
     expect(sept!.dueDate).toBe("2026-09-15");
   });
 
@@ -1530,7 +1538,7 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
     expect(sept!.dueDate).toBe("2026-09-17");
   });
 
-  it("re-bills Sept 2026 at 263 DH when a 10/09 mark predates enrollment", () => {
+  it("re-bills Sept 2026 at the FLOORED 262 DH when a 10/09 mark predates enrollment", () => {
     const schedule = generateSessionBasedSchedule(
       new Date(2026, 8, 10), // attendance anchor 2026-09-10 (Thursday)
       new Date(2026, 10, 15),
@@ -1538,7 +1546,7 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const sept = schedule.find((s) => s.monthKey === "2026-09");
-    expect(sept!.amount).toBe(263);
+    expect(sept!.amount).toBe(262); // 6 × 43.75 = 262.5 → floored, never 263
     expect(sept!.dueDate).toBe("2026-09-10");
   });
 
@@ -1554,10 +1562,11 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
     expect(sept!.dueDate).toBe("2026-09-08");
   });
 
-  it("bills Oct 2026 at the 131 DH complement (350 − 219), Nov at the full price", () => {
-    // Sept is PARTIAL (219 of 350) because the 15/09 enrollment leaves 5 of
-    // 8 sessions — so October carries the 131 complement and the pair totals
-    // exactly one monthly price. November is the standard 350 again.
+  it("bills Oct 2026 at the full 350 (transition month), Nov at the full price", () => {
+    // Sept is PARTIAL (218 of 350) because the 15/09 enrollment leaves 5 of
+    // 8 sessions — so October is the TRANSITION month: it bills the full 350
+    // and absorbs the 132 carried credit (350 − 218), leaving 218 to collect.
+    // November locks to the standard 350.
     const schedule = generateSessionBasedSchedule(
       ENROLLED,
       new Date(2026, 10, 15),
@@ -1565,7 +1574,7 @@ describe("Spec regression — T.C Math 350 DH · Tue+Thu · enrolled 2026-09-15"
       PRICE_350,
     );
     const oct = schedule.find((s) => s.monthKey === "2026-10");
-    expect(oct!.amount).toBe(131);
+    expect(oct!.amount).toBe(350);
     expect(oct!.dueDate).toBe("2026-10-01");
     expect(schedule.find((s) => s.monthKey === "2026-11")!.amount).toBe(350);
   });
@@ -1655,11 +1664,11 @@ describe("recalculateStudentSubjectLedger", () => {
     expect(result.remainingCredit).toBe(0);
     const byMonth = new Map(result.toUpsert.map((p) => [p.month, p]));
     expect(result.toUpsert).toHaveLength(3); // Sept + Oct + Nov
-    expect(byMonth.get("2026-09")!.amountDue).toBe(219); // 5 × 43.75
+    expect(byMonth.get("2026-09")!.amountDue).toBe(218); // 5 × 43.75 = 218.75 → FLOORED
     expect(byMonth.get("2026-09")!.dueDate).toBe("2026-09-15");
-    // October carries the 131 complement (350 − 219) — the first monthly
-    // price spans its two calendar months.
-    expect(byMonth.get("2026-10")!.amountDue).toBe(131);
+    // October is the TRANSITION month: the full 350, absorbing the 132
+    // carried credit (350 − 218) → the parent's next payment is 218.
+    expect(byMonth.get("2026-10")!.amountDue).toBe(350);
     expect(byMonth.get("2026-11")!.amountDue).toBe(350);
   });
 
@@ -1674,7 +1683,7 @@ describe("recalculateStudentSubjectLedger", () => {
     );
     expect(result.toDelete).toEqual([]);
     const sept = result.toUpsert.find((p) => p.month === "2026-09")!;
-    expect(sept.amountDue).toBe(263); // 6 × 43.75 = 262.5 → 263
+    expect(sept.amountDue).toBe(262); // 6 × 43.75 = 262.5 → FLOORED, never 263
     expect(sept.dueDate).toBe("2026-09-10");
   });
 
@@ -1705,10 +1714,10 @@ describe("recalculateStudentSubjectLedger", () => {
 
   it("keeps a settled installment settled when the charge grows", () => {
     // SETTLEMENT PROTECTION: Sept carries status = paid. A later attendance
-    // mark re-anchors Sept to 263, but the settled row is immutable — it
+    // mark re-anchors Sept to 262, but the settled row is immutable — it
     // keeps its amountDue, its recorded payment and its green status: it is
-    // in neither the delete list nor the upsert diff. Only the unsettled
-    // months are rebuilt around it.
+    // in neither the delete list nor the upsert diff. October is already at
+    // the full price so it is unchanged too; only November is generated.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 175, 175, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
@@ -1724,7 +1733,11 @@ describe("recalculateStudentSubjectLedger", () => {
     );
     expect(result.toDelete).toEqual([]); // Sept survived
     expect(result.toUpsert.map((p) => p.id)).not.toContain("sept"); // untouched
-    expect(result.toUpsert.find((p) => p.id === "oct")!.amountDue).toBe(87);
+    // The settled row kept its 175 even though the engine now expects 262.
+    const applied = applyDiff(existing, result);
+    expect(applied.find((p) => p.id === "sept")!.amountDue).toBe(175);
+    expect(applied.find((p) => p.id === "sept")!.isPaid).toBe(true);
+    expect(result.toUpsert.map((p) => p.month)).toEqual(["2026-11"]);
     expect(result.remainingCredit).toBe(0);
   });
 
@@ -1756,7 +1769,8 @@ describe("recalculateStudentSubjectLedger", () => {
   it("keeps a settled month settled when the charge shrinks (no surplus cascade)", () => {
     // Sept was settled at 350 and the re-anchor drops the engine's September
     // charge to 175. The settled row is immutable, so no surplus is released
-    // and October is rebuilt at its own complement (350 − 175).
+    // and October — already at the full price — is unchanged. Only the
+    // brand-new November enters the diff.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 350, 350, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
@@ -1771,29 +1785,29 @@ describe("recalculateStudentSubjectLedger", () => {
     );
     expect(result.toDelete).toEqual([]);
     expect(result.toUpsert.map((p) => p.id)).not.toContain("sept");
-    expect(result.toUpsert.find((p) => p.id === "oct")!.amountDue).toBe(175);
+    expect(result.toUpsert.map((p) => p.month)).toEqual(["2026-11"]);
     expect(result.remainingCredit).toBe(0);
   });
 
   it("lands carried wallet surplus on the next UNSETTLED month", () => {
-    // Sept is settled and the student carries 150 DH of advance credit. The
-    // settled row is immutable, so the wallet surplus flows to the rebuilt
-    // October (131 due → fully covered, goes green) and the remaining 19
-    // lands on November as green advance credit.
+    // Sept is settled (immutable) and the student carries 500 DH of advance
+    // credit — the enrollment-time full-fee payment's surplus. The wallet
+    // fully covers October's 350 and the remaining 150 lands on November as
+    // green advance credit, exactly the two-month transitional cycle.
     const existing: Payment[] = [
-      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219, 219, true),
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 218, 218, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
     ];
     const result = recalculateStudentSubjectLedger(
-      specStudent("2026-09-15T12:00:00.000Z", undefined, 150),
+      specStudent("2026-09-15T12:00:00.000Z", undefined, 500),
       "Math",
       specCtx(existing, []),
     );
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
-    expect(byId.get("oct")!.amountDue).toBe(131);
-    expect(byId.get("oct")!.amountPaid).toBe(131); // the wallet covered it
+    expect(byId.get("oct")!.amountDue).toBe(350);
+    expect(byId.get("oct")!.amountPaid).toBe(350); // the wallet covered it
     expect(byId.get("oct")!.isPaid).toBe(true);
-    expect(byId.get("nov")!.amountPaid).toBe(19); // the remainder, green
+    expect(byId.get("nov")!.amountPaid).toBe(150); // the remainder, green
     expect(byId.get("nov")!.isPaid).toBe(false);
     expect(result.remainingCredit).toBe(0); // wallet fully absorbed
   });
@@ -1869,8 +1883,8 @@ describe("recalculateStudentSubjectLedger", () => {
       "Math",
       specCtx([], []),
     );
-    // 300 / 8 = 37.5; Sept = 5 × 37.5 = 187.5 → 188.
-    expect(result.toUpsert.find((p) => p.month === "2026-09")!.amountDue).toBe(188);
+    // 300 / 8 = 37.5; Sept = 5 × 37.5 = 187.5 → FLOORED to 187.
+    expect(result.toUpsert.find((p) => p.month === "2026-09")!.amountDue).toBe(187);
   });
 
   it("drops unsettled stale rows when the enrollment was dropped, keeps settled ones", () => {
@@ -1941,13 +1955,11 @@ describe("recalculateStudentSubjectLedger", () => {
 });
 
 // ---------------------------------------------------------------------------
-// roundMAD — the integer contract (no decimals ever reach a parent)
+// roundMAD / floorMAD — the integer contract (no decimals ever reach a parent)
 // ---------------------------------------------------------------------------
 
-describe("roundMAD — smart rounding", () => {
-  it("rounds a fractional session cost to a clean whole MAD", () => {
-    // The spec example: 5 × 43.75 = 218.75 → 219.
-    expect(roundMAD(5 * (350 / 8))).toBe(219);
+describe("roundMAD — smart rounding for paid/credit figures", () => {
+  it("rounds a fractional amount to a clean whole MAD", () => {
     expect(roundMAD(218.75)).toBe(219);
     expect(roundMAD(218.4)).toBe(218);
   });
@@ -1956,6 +1968,22 @@ describe("roundMAD — smart rounding", () => {
     expect(roundMAD(350)).toBe(350);
     expect(roundMAD(0)).toBe(0);
     expect(Number.isInteger(roundMAD(131.25))).toBe(true);
+  });
+});
+
+describe("floorMAD — the parent-friendly month-due floor", () => {
+  it("FLOORS a prorated month due — never rounds up", () => {
+    // The spec examples: 5 × 43.75 = 218.75 → 218; 7 × 56.25 = 393.75 → 393.
+    expect(floorMAD(5 * (350 / 8))).toBe(218);
+    expect(floorMAD(218.75)).toBe(218);
+    expect(floorMAD(7 * (450 / 8))).toBe(393);
+    expect(floorMAD(337.5)).toBe(337);
+  });
+
+  it("leaves whole months at the exact full price", () => {
+    expect(floorMAD(8 * (350 / 8))).toBe(350);
+    expect(floorMAD(450)).toBe(450);
+    expect(Number.isInteger(floorMAD(306.25))).toBe(true);
   });
 });
 
@@ -1983,24 +2011,39 @@ describe("getPaymentsToReceive — clean complement worklist", () => {
     });
   }
 
-  it("(spec example) reports a clean 131 MAD complement on the Month-2 row", () => {
-    // Month 1 = 219 (5/8 × 350 rounded) settled; Month 2 carries the 131
-    // COMPLEMENT (350 − 219) with nothing paid yet → the parent's next
-    // collection is exactly 131, a clean integer.
+  it("(spec example, Case A) prompts for the Month-2 complement after the carried credit (218 MAD)", () => {
+    // TWO-MONTH TRANSITIONAL CYCLE, Case A: the parent paid the full 350 at
+    // enrollment → Month 1 settled at its floored 218 and the 132 surplus
+    // (350 − 218) carried onto Month 2. Month 2 is the full 350 with 132
+    // credit already on it, so the parent's next collection is exactly 218.
     const payments: Payment[] = [
-      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 219, 219, true),
-      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 131, 0, false),
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 218, 218, true),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 132, false),
     ];
     const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
     expect(rows).toHaveLength(1);
     const row = rows[0];
     expect(row.studentName).toBe("Test Student");
     expect(row.subject).toBe("Math");
-    expect(row.monthlyPrice).toBe(131);
-    expect(row.creditCarried).toBe(0);
-    expect(row.complement).toBe(131);
+    expect(row.monthlyPrice).toBe(350);
+    expect(row.creditCarried).toBe(132);
+    expect(row.complement).toBe(218);
     expect(Number.isInteger(row.complement)).toBe(true);
     expect(row.isOverdue).toBe(true); // due 2026-10-01 < TODAY 2026-10-15
+  });
+
+  it("(spec example, Case B) prompts for the full price when only the prorated fee was paid", () => {
+    // Case B: the parent paid only Month 1's floored 218 → no surplus carried,
+    // so Month 2 is the full 350 with nothing on it yet.
+    const payments: Payment[] = [
+      makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 218, 218, true),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
+    ];
+    const rows = getPaymentsToReceive(payments, [specStudent()], TODAY);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].monthlyPrice).toBe(350);
+    expect(rows[0].creditCarried).toBe(0);
+    expect(rows[0].complement).toBe(350);
   });
 
   it("flags overdue months and drops fully-covered ones", () => {

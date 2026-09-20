@@ -160,7 +160,7 @@ function resetStore() {
 /**
  * Seeds a hydrated Rule A ledger: student + timetable + price, and the
  * installments a pre-mark sync would have built off the ENROLLMENT anchor
- * (Sept = 219 for the 15/09 joiner).
+ * (Sept = 218 for the 15/09 joiner, 5/8 × 43.75 floored).
  */
 function seedRuleALedger(payments: Payment[], advanceBalance = 0) {
   resetStore();
@@ -294,12 +294,12 @@ describe("reactive ledger — markAttendance trigger", () => {
     const ledger = ledgerByMonth();
     expect(ledger.size).toBeGreaterThan(0);
     // The 10/09 mark predates registration but is INCLUSIVE — Sept re-bills
-    // to 6 × 43.75 = 263 and is dated on the anchor.
-    expect(ledger.get("2026-09")!.amountDue).toBe(263);
+    // to 6 × 43.75 = 262.5 → the FLOORED 262, dated on the anchor.
+    expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    // October carries the 87 DH complement (350 − 263) — the first monthly
-    // price spans its two calendar months.
-    expect(ledger.get("2026-10")!.amountDue).toBe(87);
+    // October is the transition month: the full 350 (never the remainder),
+    // absorbing the 88 carried credit (350 − 262) → 262 to collect.
+    expect(ledger.get("2026-10")!.amountDue).toBe(350);
   });
 
   it("re-bills Sept from a pre-registration attendance mark", async () => {
@@ -316,9 +316,9 @@ describe("reactive ledger — markAttendance trigger", () => {
     await flushReactive();
 
     const ledger = ledgerByMonth();
-    expect(ledger.get("2026-09")!.amountDue).toBe(263);
+    expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    expect(ledger.get("2026-10")!.amountDue).toBe(87); // the 350 − 263 complement
+    expect(ledger.get("2026-10")!.amountDue).toBe(350); // the full price
   });
 
   it("keeps exactly one installment per month after re-anchoring", async () => {
@@ -333,7 +333,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     await flushReactive();
 
     expectOneRowPerMonth();
-    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(263);
+    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(262);
   });
 
   it("never resets a settled installment when attendance re-anchors it", async () => {
@@ -341,8 +341,8 @@ describe("reactive ledger — markAttendance trigger", () => {
     // enrollment anchor. A 17/09 attendance mark would drop the engine's
     // September charge to 175 and would previously have rolled the 175
     // surplus onto October — but the settled row is immutable. It keeps its
-    // amountDue, its payment and its green status; only the unsettled
-    // October row is rebuilt (onto its own 175 complement for the new anchor).
+    // amountDue, its payment and its green status; October is already at the
+    // full price, so the 17/09 anchor leaves it untouched too.
     seedRuleALedger([
       payment("sept", "2026-09-15", 350, "A", 350),
       payment("oct", "2026-10-01", 350),
@@ -358,22 +358,23 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(sept.amountDue).toBe(350); // untouched
     expect(sept.amountPaid).toBe(350); // untouched
     expect(sept.isPaid).toBe(true); // still green
-    // October was rebuilt for the 17/09 anchor: 350 − 175 = 175.
-    expect(ledger.get("2026-10")!.amountDue).toBe(175);
+    // October was already at the full price — the anchor move leaves it as is.
+    expect(ledger.get("2026-10")!.amountDue).toBe(350);
     expect(ledger.get("2026-10")!.amountPaid).toBe(0);
   });
 
   it("lands carried wallet surplus on the next UNSETTLED month as green credit", async () => {
-    // Sept settled, 150 DH parked in the wallet. A mark on the enrollment
-    // date re-derives the ledger. The settled September row is immutable, so
-    // the wallet surplus flows to the rebuilt October (131 due → absorbs
-    // 131) and the remaining 19 lands on November.
+    // Sept settled, 500 DH parked in the wallet — the enrollment-time
+    // full-fee surplus. A mark on the enrollment date re-derives the ledger.
+    // The settled September row is immutable, so the wallet surplus fully
+    // covers the rebuilt October (350) and the remaining 150 lands on
+    // November as green advance credit.
     seedRuleALedger(
       [
-        payment("sept", "2026-09-15", 219, "A", 219),
+        payment("sept", "2026-09-15", 218, "A", 218),
         payment("oct", "2026-10-01", 350),
       ],
-      150, // advanceBalance
+      500, // advanceBalance
     );
     vi.clearAllMocks();
 
@@ -383,11 +384,11 @@ describe("reactive ledger — markAttendance trigger", () => {
     await flushReactive();
 
     const ledger = ledgerByMonth();
-    expect(ledger.get("2026-09")!.amountPaid).toBe(219); // untouched
-    expect(ledger.get("2026-10")!.amountDue).toBe(131);
-    expect(ledger.get("2026-10")!.amountPaid).toBe(131); // wallet covered it
+    expect(ledger.get("2026-09")!.amountPaid).toBe(218); // untouched
+    expect(ledger.get("2026-10")!.amountDue).toBe(350);
+    expect(ledger.get("2026-10")!.amountPaid).toBe(350); // wallet covered it
     expect(ledger.get("2026-10")!.isPaid).toBe(true);
-    expect(ledger.get("2026-11")!.amountPaid).toBe(19); // the remainder, green
+    expect(ledger.get("2026-11")!.amountPaid).toBe(150); // the remainder, green
     expect(ledger.get("2026-11")!.isPaid).toBe(false);
     expect(walletBalance()).toBe(0); // wallet drained
 
@@ -441,7 +442,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     const store = useEnnajdState.getState();
     await store.markAttendance(STUDENT_ID, "session-math-thu", "2026-09-10", "present");
     await flushReactive();
-    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(263);
+    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(262);
 
     toast.success.mockClear();
     // Same student+session+date → the existing record is replaced, the anchor
@@ -453,7 +454,7 @@ describe("reactive ledger — markAttendance trigger", () => {
       });
     await flushReactive();
 
-    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(263);
+    expect(ledgerByMonth().get("2026-09")!.amountDue).toBe(262);
     expect(toast.success).not.toHaveBeenCalled();
   });
 
