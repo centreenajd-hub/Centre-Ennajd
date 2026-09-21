@@ -288,7 +288,8 @@ function expectOneRowPerMonth() {
 // perSession = 43.75):
 //   Month 1 = full 350 when sessionCount >= 8 (or joined from session 1),
 //             else floorMAD(sessionCount × 43.75)
-//   Month 2 = 350 when Month 1 was full, else the 350 − Month 1 complement
+//   Month 2 = 350 when Month 1 was full, else the monthly price net of the
+//             carryover credit (350 − (350 − Month 1) = Month 1)
 //   Month 3+ = 350
 // Green is EXPLICIT — every month starts and stays RED until the user settles
 // it, no matter how much credit sits on it.
@@ -378,11 +379,13 @@ describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)",
     expectOneRowPerMonth();
   });
 
-  it("(2) a student attending 3 sessions bills 131 / 219, both RED", async () => {
+  it("(2) a student attending 3 sessions bills 131 / 131, both RED", async () => {
     // The student's first attendance is the 6th scheduled session, leaving 3
     // billable sessions in September: 3 × 43.75 = 131.25 → floorMAD = 131 for
-    // Month 1. Month 2 carries the complement 350 − 131 = 219. Both stay RED
-    // — the marks prove delivery, they never settle a month.
+    // Month 1. The carryover credit is 350 − 131 = 219 (pre-paid by Month 1's
+    // invoice), so Month 2 is billed at 350 − 219 = 131 — the same floored
+    // amount, never the bare 219 credit. Both stay RED — the marks prove
+    // delivery, they never settle a month.
     seedContractLedger();
     await markSessions(["2026-09-22", "2026-09-24", "2026-09-29"]);
 
@@ -395,7 +398,7 @@ describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)",
     expect(sept.amountPaid).toBe(0);
     expect(isPaymentFullyPaid(sept)).toBe(false);
 
-    expect(oct.amountDue).toBe(219);
+    expect(oct.amountDue).toBe(131);
     expect(oct.isPaid).toBe(false);
     expect(oct.amountPaid).toBe(0);
     expect(isPaymentFullyPaid(oct)).toBe(false);
@@ -404,16 +407,16 @@ describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)",
   });
 
   it("(3) updating attendance from 3 → 8 sessions immediately reprices to 350 / 350", async () => {
-    // THE FROZEN-AMOUNT FIX: the 3-session state holds 131 / 219. Adding the
+    // THE FROZEN-AMOUNT FIX: the 3-session state holds 131 / 131. Adding the
     // five earlier September marks moves the anchor to the 1st, so the
     // reactive recalc re-derives the ledger LIVE — Month 1 jumps to the full
-    // 350 and Month 2, no longer a complement, becomes the full 350 too. No
-    // manual recalc, no page refresh.
+    // 350 and Month 2, no longer carryover-adjusted, becomes the full 350
+    // too. No manual recalc, no page refresh.
     seedContractLedger();
     await markSessions(["2026-09-22", "2026-09-24", "2026-09-29"]);
     let ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountDue).toBe(131);
-    expect(ledger.get("2026-10")!.amountDue).toBe(219);
+    expect(ledger.get("2026-10")!.amountDue).toBe(131);
 
     await markSessions(["2026-09-01", "2026-09-03", "2026-09-08", "2026-09-10", "2026-09-15"]);
     ledger = ledgerByMonth();
@@ -437,8 +440,8 @@ describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)",
   });
 
   it("(4) settling Month 1 turns ONLY Month 1 green — Month 2 stays red", async () => {
-    // THE GREEN MONTH-2 FIX: the 3-session ledger is 131 / 219. Settling
-    // September flips it green alone; October keeps its 219 due, no credit,
+    // THE GREEN MONTH-2 FIX: the 3-session ledger is 131 / 131. Settling
+    // September flips it green alone; October keeps its 131 due, no credit,
     // and stays RED — it is never auto-settled and never counts toward the
     // settled total.
     seedContractLedger();
@@ -456,11 +459,11 @@ describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)",
     expect(sept.isPaid).toBe(true);
     expect(isPaymentFullyPaid(sept)).toBe(true);
     expect(sept.amountDue).toBe(131); // unchanged by the settlement
-    // Month 2: still 219, still unsettled, still owing everything.
+    // Month 2: still 131, still unsettled, still owing everything.
     expect(oct.isPaid).toBe(false);
     expect(isPaymentFullyPaid(oct)).toBe(false);
-    expect(oct.amountDue).toBe(219);
-    expect(getPaymentRemaining(oct)).toBe(219);
+    expect(oct.amountDue).toBe(131);
+    expect(getPaymentRemaining(oct)).toBe(131);
   });
 });
 
@@ -499,15 +502,16 @@ describe("reactive ledger — markAttendance trigger", () => {
     // to 6 × 43.75 = 262.5 → the FLOORED 262, dated on the anchor.
     expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    // October is the transition month: the 88 complement (350 − 262), so the
-    // Sept+Oct pair totals exactly one full monthly price.
-    expect(ledger.get("2026-10")!.amountDue).toBe(88);
+    // October is the transition month: the carryover credit is 350 − 262 =
+    // 88, so October bills 350 − 88 = 262 — the same floored amount, never
+    // the bare 88 credit.
+    expect(ledger.get("2026-10")!.amountDue).toBe(262);
   });
 
   it("re-bills Sept from a pre-registration attendance mark", async () => {
     seedRuleALedger([
       payment("sept", "2026-09-15", 218),
-      payment("oct", "2026-10-01", 132),
+      payment("oct", "2026-10-01", 218),
       payment("nov", "2026-11-01", 350),
     ]);
 
@@ -520,14 +524,15 @@ describe("reactive ledger — markAttendance trigger", () => {
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountDue).toBe(262);
     expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-10");
-    // The 10/09 anchor re-prices October to the 88 complement (350 − 262).
-    expect(ledger.get("2026-10")!.amountDue).toBe(88);
+    // The 10/09 anchor re-prices October to the carryover-adjusted 262
+    // (350 − (350 − 262)).
+    expect(ledger.get("2026-10")!.amountDue).toBe(262);
   });
 
   it("keeps exactly one installment per month after re-anchoring", async () => {
     seedRuleALedger([
       payment("sept", "2026-09-15", 218),
-      payment("oct", "2026-10-01", 132),
+      payment("oct", "2026-10-01", 218),
     ]);
 
     await useEnnajdState
@@ -545,7 +550,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     // September charge to 175 and would previously have rolled the 175
     // surplus onto October — but the settled row is immutable. It keeps its
     // amountDue, its payment and its green status; October is re-priced to
-    // the 175 complement (350 − 175) but carries no credit.
+    // the carryover-adjusted 175 (350 − (350 − 175)) but carries no credit.
     seedRuleALedger([
       payment("sept", "2026-09-15", 350, "A", 350, true),
       payment("oct", "2026-10-01", 350),
@@ -561,9 +566,9 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(sept.amountDue).toBe(350); // untouched
     expect(sept.amountPaid).toBe(350); // untouched
     expect(sept.isPaid).toBe(true); // still green
-    // October absorbed the re-anchor's complement; the wallet is empty, so
-    // it carries no credit.
-    expect(ledger.get("2026-10")!.amountDue).toBe(175); // 350 − 175
+    // October absorbed the re-anchor; the wallet is empty, so it carries no
+    // credit.
+    expect(ledger.get("2026-10")!.amountDue).toBe(175); // mirrors Month 1
     expect(ledger.get("2026-10")!.amountPaid).toBe(0);
   });
 
@@ -571,8 +576,9 @@ describe("reactive ledger — markAttendance trigger", () => {
     // Sept settled, 500 DH parked in the wallet — the enrollment-time
     // full-fee surplus. A mark on the enrollment date re-derives the ledger.
     // The settled September row is immutable, so the wallet surplus covers
-    // the rebuilt October complement (132), November's full 350, and the
-    // last 18 lands on December as green advance credit.
+    // the rebuilt October due (218, net of the carryover credit) and lands
+    // its remaining 282 on November as partial green credit (68 still owed);
+    // the wallet is fully absorbed, so December carries nothing.
     seedRuleALedger(
       [
         payment("sept", "2026-09-15", 218, "A", 218, true),
@@ -589,20 +595,20 @@ describe("reactive ledger — markAttendance trigger", () => {
 
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountPaid).toBe(218); // untouched
-    expect(ledger.get("2026-10")!.amountDue).toBe(132); // the complement
-    expect(ledger.get("2026-10")!.amountPaid).toBe(132); // wallet covered it
+    expect(ledger.get("2026-10")!.amountDue).toBe(218); // net of the credit
+    expect(ledger.get("2026-10")!.amountPaid).toBe(218); // wallet covered it
     // SETTLEMENT IS EXPLICIT: the wallet covered October exactly, but it is
     // NOT green — nothing is owed, yet it was never settled by the user.
     expect(ledger.get("2026-10")!.isPaid).toBe(false);
     expect(getPaymentRemaining(ledger.get("2026-10")!)).toBe(0);
     expect(ledger.get("2026-11")!.amountDue).toBe(350);
-    expect(ledger.get("2026-11")!.amountPaid).toBe(350); // covered
+    expect(ledger.get("2026-11")!.amountPaid).toBe(282); // partial credit
     expect(ledger.get("2026-11")!.isPaid).toBe(false);
-    expect(getPaymentRemaining(ledger.get("2026-11")!)).toBe(0);
-    // The generation horizon (now + 1 month) reaches December, so the 18
-    // tail lands on it instead of parking in the wallet.
+    expect(getPaymentRemaining(ledger.get("2026-11")!)).toBe(68); // 350 − 282
+    // The generation horizon (now + 1 month) reaches December, but the
+    // wallet was exhausted on November, so it carries nothing.
     expect(ledger.get("2026-12")!.amountDue).toBe(350);
-    expect(ledger.get("2026-12")!.amountPaid).toBe(18);
+    expect(ledger.get("2026-12")!.amountPaid).toBe(0);
     expect(ledger.get("2026-12")!.isPaid).toBe(false);
     expect(walletBalance()).toBe(0); // wallet drained
 
@@ -613,7 +619,7 @@ describe("reactive ledger — markAttendance trigger", () => {
   it("commits the rebuild in ONE payments write (single-write contract)", async () => {
     seedRuleALedger([
       payment("sept", "2026-09-15", 218),
-      payment("oct", "2026-10-01", 132),
+      payment("oct", "2026-10-01", 218),
     ]);
     vi.clearAllMocks();
 
@@ -680,7 +686,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     seedRuleALedger([
       payment("sept", "2026-09-15", 218),
       payment("sept-dup", "2026-09-17", 100),
-      payment("oct", "2026-10-01", 132),
+      payment("oct", "2026-10-01", 218),
       payment("nov", "2026-11-01", 350),
     ]);
 
@@ -797,7 +803,7 @@ describe("regeneratePaymentLedger", () => {
   it("rebuilds Rule A, keeps Rule B, and deletes before inserting", async () => {
     seedRuleALedger([
       payment("sept", "2026-09-15", 218),
-      payment("oct", "2026-10-01", 132),
+      payment("oct", "2026-10-01", 218),
       payment("ruleB", "2026-10-15", 500, "B"),
     ]);
 
@@ -841,7 +847,7 @@ describe("regeneratePaymentLedger", () => {
     // unsettled October row is deleted and regenerated.
     seedRuleALedger([
       payment("sept", "2026-09-15", 218, "A", 218, true), // settled
-      payment("oct", "2026-10-01", 350), // unsettled
+      payment("oct", "2026-10-01", 218), // unsettled
     ]);
 
     const ok = await useEnnajdState.getState().regeneratePaymentLedger();
@@ -892,10 +898,10 @@ describe("recordPartialPayment — waterfall", () => {
   });
 
   it("absorbs a 350 payment as Sept 175 + Oct 175, one row per month", async () => {
-    // A 17/09 joiner: September is 175 (4 sessions × 43.75) and October
-    // carries the 175 complement (350 − 175), so the pair totals exactly one
-    // monthly price. A 350 payment settles both — never a second September
-    // row.
+    // A 17/09 joiner: September is 175 (4 sessions × 43.75) and October's due
+    // is the monthly price net of the carryover credit (350 − 175 = 175), so
+    // both months cost the same clean 175. A 350 payment settles both — never
+    // a second September row.
     seedRuleALedger([
       payment("sept", "2026-09-17", 175),
       payment("oct", "2026-10-01", 175),
