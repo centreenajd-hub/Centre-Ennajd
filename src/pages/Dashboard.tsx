@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import { GlobalAttendanceSearch } from "@/components/dashboard/GlobalAttendanceSearch";
 import { LiveSessionCard } from "@/components/dashboard/LiveSessionCard";
 import { ModalAttendance } from "@/components/dashboard/ModalAttendance";
-import { PaymentsToReceiveCard } from "@/components/dashboard/PaymentsToReceiveCard";
 import { UpcomingSessionNotice } from "@/components/dashboard/UpcomingSessionNotice";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
 import { useNowTick } from "@/hooks/use-now-tick";
@@ -93,8 +92,6 @@ export default function Dashboard() {
       </div>
 
       <GlobalAttendanceSearch now={now} date={date} liveSessions={liveSessions} />
-
-      <PaymentsToReceiveCard />
 
       <div className="space-y-3">
         <h2 className="text-lg font-bold tracking-tight">{t("liveSessions")}</h2>
