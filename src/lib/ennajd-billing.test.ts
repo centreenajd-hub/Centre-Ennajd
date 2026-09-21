@@ -815,7 +815,10 @@ describe("applyCreditWaterfall", () => {
     expect(result.remaining).toBe(0);
     expect(result.anyChanged).toBe(true);
     expect(result.updated.find((p) => p.id === "p1")!.amountPaid).toBe(300);
-    expect(isPaymentFullyPaid(result.updated.find((p) => p.id === "p1")!)).toBe(true);
+    // SETTLEMENT IS EXPLICIT: the wallet covers p1 entirely, but the row is
+    // never flipped to paid — it simply owes nothing (remaining 0).
+    expect(isPaymentFullyPaid(result.updated.find((p) => p.id === "p1")!)).toBe(false);
+    expect(getPaymentRemaining(result.updated.find((p) => p.id === "p1")!)).toBe(0);
     expect(result.updated.find((p) => p.id === "p2")!.amountPaid).toBe(200);
     expect(isPaymentFullyPaid(result.updated.find((p) => p.id === "p2")!)).toBe(false);
     expect(result.updated.find((p) => p.id === "p3")).toBeUndefined();
@@ -848,7 +851,9 @@ describe("applyCreditWaterfall", () => {
     ];
     const result = applyCreditWaterfall(payments, STUDENT_ID, "PC", 700, "2025-01-15", NOW);
     expect(result.remaining).toBe(400);
-    expect(isPaymentFullyPaid(result.updated[0])).toBe(true);
+    // The covered row is not settled — credit never flips isPaid.
+    expect(isPaymentFullyPaid(result.updated[0])).toBe(false);
+    expect(getPaymentRemaining(result.updated[0])).toBe(0);
   });
 
   it("returns zero credit input unchanged", () => {
@@ -938,7 +943,9 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
 
   it("(a) surplus beyond the two-month transitional cycle lands on the next month as partial credit, and any remainder parks as advance_balance", () => {
     // 400 covers Sept (218) + Oct (132) = 350 exactly, leaving 50 → November
-    // is PARTIALLY PAID (green chip), wallet exhausted, nothing parks.
+    // carries the 50 as advance credit, wallet exhausted, nothing parks.
+    // No row is settled: credit covers Sept and Oct exactly, but settlement
+    // is an explicit user act — they stay RED with a 0 remaining gap.
     const partial = applyCreditWaterfall(
       specPayments(),
       STUDENT_ID,
@@ -949,10 +956,12 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
     );
     const byId = new Map(partial.updated.map((p) => [p.id, p]));
     expect(byId.get("sept")!.amountPaid).toBe(PRORATED_FIRST);
-    expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(true);
+    expect(isPaymentFullyPaid(byId.get("sept")!)).toBe(false);
+    expect(getPaymentRemaining(byId.get("sept")!)).toBe(0);
     expect(byId.get("oct")!.amountPaid).toBe(MONTH2_COMPLEMENT);
-    expect(isPaymentFullyPaid(byId.get("oct")!)).toBe(true);
-    expect(byId.get("nov")!.amountPaid).toBe(50); // green advance credit
+    expect(isPaymentFullyPaid(byId.get("oct")!)).toBe(false);
+    expect(getPaymentRemaining(byId.get("oct")!)).toBe(0);
+    expect(byId.get("nov")!.amountPaid).toBe(50); // advance credit
     expect(byId.get("nov")!.isPaid).toBe(false);
     expect(partial.remaining).toBe(0); // advance_balance untouched
 
@@ -966,13 +975,13 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
       "2026-09-30",
       NOW,
     );
-    expect(surplus.updated.every(isPaymentFullyPaid)).toBe(true);
+    expect(surplus.updated.every((p) => getPaymentRemaining(p) === 0)).toBe(true);
     expect(surplus.remaining).toBe(
       1000 - PRORATED_FIRST - MONTH2_COMPLEMENT - FULL_MONTH,
     ); // 300
   });
 
-  it("(b) a wallet exactly covering multiple months leaves them fully paid with zero remainder", () => {
+  it("(b) a wallet exactly covering multiple months leaves them covered with zero remainder", () => {
     const exact = PRORATED_FIRST + MONTH2_COMPLEMENT + FULL_MONTH; // 700
     const result = applyCreditWaterfall(
       specPayments(),
@@ -984,9 +993,10 @@ describe("applyCreditWaterfall — Rule A carryover contract", () => {
     );
     expect(result.remaining).toBe(0);
     expect(result.updated).toHaveLength(3);
-    // No partial month: every credited row is settled, none left green.
-    expect(result.updated.every((p) => isPaymentFullyPaid(p))).toBe(true);
-    expect(result.updated.every((p) => p.isPaid)).toBe(true);
+    // No partial month: every credited row is fully covered, though none is
+    // explicitly settled — green only comes from the ✓ action.
+    expect(result.updated.every((p) => getPaymentRemaining(p) === 0)).toBe(true);
+    expect(result.updated.every((p) => p.isPaid)).toBe(false);
   });
 
   it("(c) a wallet fully absorbed by the first gap leaves advance_balance at 0", () => {
@@ -1191,7 +1201,10 @@ describe("reconcilePaymentAmounts", () => {
     ).toHaveLength(0);
   });
 
-  it("never re-prices a row with an adjusted balance (amount_paid > 0)", () => {
+  it("never re-prices a settled row even when its credit overshoots the due", () => {
+    // SETTLEMENT PROTECTION is the explicit flag only. amount_paid (400) can
+    // exceed amountDue (320) without locking anything — the lock is isPaid.
+    // Here the row IS settled, so the self-heal leaves it alone.
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 400, true),
     ];
@@ -1205,6 +1218,28 @@ describe("reconcilePaymentAmounts", () => {
         "2025-02-15",
       ),
     ).toHaveLength(0);
+  });
+
+  it("re-prices a row carrying credit but no settlement (credit is not a lock)", () => {
+    // THE FROZEN-AMOUNT FIX: amount_paid = 400 with isPaid false is NOT a
+    // lock — the self-heal re-prices it to the live engine expectation and
+    // keeps its credit.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 400, false),
+    ];
+    const patches = reconcilePaymentAmounts(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(patches).toHaveLength(1);
+    expect(patches[0].id).toBe("p1");
+    expect(patches[0].amountDue).toBe(400);
+    expect(patches[0].amountPaid).toBe(400);
+    expect(patches[0].isPaid).toBe(false);
   });
 
   it("corrects a stale amount on an UNSETTLED row", () => {
@@ -1296,12 +1331,12 @@ describe("reconcileRuleALedger", () => {
     });
   }
 
-  it("never re-prices or deletes a row with a recorded settlement", () => {
-    // SETTLEMENT PROTECTION: the row carries amount_paid = 150 > 0, so the
-    // self-heal must leave it exactly as it is — even though its amountDue
-    // (320) is stale against the engine's 400 expectation.
+  it("never re-prices or deletes a SETTLED row (the explicit flag is the lock)", () => {
+    // SETTLEMENT PROTECTION: the row carries status = paid, so even though
+    // its amountDue (320) drifted below the engine's expectation (400), the
+    // self-heal must not touch it. A false isPaid is the user's call to keep.
     const payments: Payment[] = [
-      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 150, false),
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 320, true),
     ];
     const result = reconcileRuleALedger(
       payments,
@@ -1313,6 +1348,33 @@ describe("reconcileRuleALedger", () => {
     );
     expect(result.update).toEqual([]);
     expect(result.delete).toEqual([]);
+  });
+
+  it("re-prices a row carrying only credit — credit is not a lock (frozen-amount fix)", () => {
+    // amount_paid > 0 with no settlement flag: the row is NOT locked, so the
+    // self-heal re-prices it to the live engine expectation and consolidates
+    // its credit onto it — this is what lifts the frozen 131 MAD.
+    const payments: Payment[] = [
+      makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 320, 150, false),
+    ];
+    const result = reconcileRuleALedger(
+      payments,
+      [ledgerStudent()],
+      sessions,
+      prices,
+      [],
+      "2025-02-15",
+    );
+    expect(result.delete).toEqual([]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01",
+        amountPaid: 150, // preserved
+        isPaid: false, // never auto-settled
+      },
+    ]);
   });
 
   it("re-prices an UNSETTLED stale row (paid progress preserved)", () => {
@@ -1438,10 +1500,10 @@ describe("reconcileRuleALedger", () => {
     ]);
   });
 
-  it("never collapses rows that carry a recorded settlement", () => {
-    // SETTLEMENT PROTECTION: both rows are settled (amount_paid > 0), so the
-    // self-heal keeps them both verbatim — the Payments page aggregates per
-    // student+subject anyway, and a settled row must never be deleted.
+  it("never collapses a SETTLED row, and consolidates credit-only duplicates", () => {
+    // SETTLEMENT PROTECTION: neither row is settled, but they are same-month
+    // duplicates — the surplus row is deleted and its credit consolidated
+    // onto the keeper (which is never flipped to paid by credit alone).
     const payments: Payment[] = [
       makePayment("p1", STUDENT_ID, "Math", "2025-01-01", 400, 250, false),
       makePayment("p2", STUDENT_ID, "Math", "2025-01-08", 400, 150, false),
@@ -1454,8 +1516,16 @@ describe("reconcileRuleALedger", () => {
       [],
       "2025-02-15",
     );
-    expect(result.update).toEqual([]);
-    expect(result.delete).toEqual([]);
+    expect(result.delete).toEqual(["p2"]);
+    expect(result.update).toEqual([
+      {
+        id: "p1",
+        amountDue: 400,
+        dueDate: "2025-01-01",
+        amountPaid: 400, // 250 + 150 consolidated
+        isPaid: false, // credit covers it, but settlement stays explicit
+      },
+    ]);
   });
 
   it("re-dates the keeper onto the anchor when attendance moved it", () => {
@@ -1734,11 +1804,11 @@ describe("recalculateStudentSubjectLedger", () => {
     expect(result.remainingCredit).toBe(0);
   });
 
-  it("never pulls credit back from a settled month (shortfall cascade blocked)", () => {
-    // Both rows carry a recorded settlement (Sept status = paid; October has
-    // amount_paid = 100 > 0). Neither may be reset or re-priced: Sept keeps
-    // its 175, October keeps its 350 charge and its 100 credit — the only
-    // row the rebuild emits is the brand-new November.
+  it("keeps a settled month and re-applies a credit-only month's credit through the rebuild", () => {
+    // Sept carries the settlement flag (immutable). October carries 100 of
+    // CREDIT but no flag — so it is NOT locked: the rebuild re-prices it and
+    // its credit is pooled and re-applied. The 10/09 re-anchor makes Sept
+    // 218 and October the 132 complement, so the 100 lands back on October.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-17", 175, 175, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 100, false),
@@ -1753,9 +1823,16 @@ describe("recalculateStudentSubjectLedger", () => {
       specCtx(existing, attendance),
     );
     expect(result.toDelete).toEqual([]);
+    // The settled row is never re-written.
     expect(result.toUpsert.map((p) => p.id)).not.toContain("sept");
-    expect(result.toUpsert.map((p) => p.id)).not.toContain("oct");
-    expect(result.toUpsert.map((p) => p.month)).toEqual(["2026-11"]);
+    // October re-priced to the 132 complement with its 100 credit re-applied
+    // — and NOT settled (credit never flips isPaid).
+    const oct = result.toUpsert.find((p) => p.month === "2026-10")!;
+    expect(oct).toBeDefined();
+    expect(oct.amountDue).toBe(132);
+    expect(oct.amountPaid).toBe(100);
+    expect(oct.isPaid).toBe(false);
+    expect(result.toUpsert.map((p) => p.month)).toEqual(["2026-10", "2026-11"]);
     expect(result.remainingCredit).toBe(0);
   });
 
@@ -1789,7 +1866,9 @@ describe("recalculateStudentSubjectLedger", () => {
     // Sept is settled (immutable) and the student carries 500 DH of advance
     // credit — the enrollment-time full-fee payment's surplus. The wallet
     // covers October's 132 complement and November's 350 full price (482
-    // total); the last 18 rolls onto the following month as green credit.
+    // total); the last 18 rolls onto the following month as advance credit.
+    // No month is settled by this: credit covers October/November exactly,
+    // but they stay RED until the user settles them.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 218, 218, true),
       makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 0, false),
@@ -1802,10 +1881,12 @@ describe("recalculateStudentSubjectLedger", () => {
     const byId = new Map(result.toUpsert.map((p) => [p.id, p]));
     expect(byId.get("oct")!.amountDue).toBe(132); // the complement
     expect(byId.get("oct")!.amountPaid).toBe(132); // the wallet covered it
-    expect(byId.get("oct")!.isPaid).toBe(true);
+    expect(byId.get("oct")!.isPaid).toBe(false); // never auto-settled
+    expect(getPaymentRemaining(byId.get("oct")!)).toBe(0);
     expect(byId.get("nov")!.amountDue).toBe(350);
-    expect(byId.get("nov")!.amountPaid).toBe(350); // green
-    expect(byId.get("nov")!.isPaid).toBe(true);
+    expect(byId.get("nov")!.amountPaid).toBe(350); // covered
+    expect(byId.get("nov")!.isPaid).toBe(false);
+    expect(getPaymentRemaining(byId.get("nov")!)).toBe(0);
     expect(result.remainingCredit).toBe(18); // the tail, still unabsorbed
   });
 
@@ -1884,13 +1965,13 @@ describe("recalculateStudentSubjectLedger", () => {
     expect(result.toUpsert.find((p) => p.month === "2026-09")!.amountDue).toBe(187);
   });
 
-  it("drops unsettled stale rows when the enrollment was dropped, keeps settled ones", () => {
+  it("drops unsettled stale rows when the enrollment was dropped, keeps SETTLED ones", () => {
     // No enrollment left: the UNSETTLED row is stale and its (zero) credit is
-    // released. The row carrying a recorded settlement (oct, amount_paid =
-    // 100) is immutable and stays as the record of what the parent paid.
+    // released. The SETTLED row (status = paid) is immutable and stays as the
+    // record of what the parent paid.
     const existing: Payment[] = [
       makePayment("sept", STUDENT_ID, "Math", "2026-09-15", 218, 0, false),
-      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 100, false),
+      makePayment("oct", STUDENT_ID, "Math", "2026-10-01", 350, 350, true),
     ];
     const noEnrollment = makeStudent({ level: "T.C", enrollments: [] });
     const result = recalculateStudentSubjectLedger(

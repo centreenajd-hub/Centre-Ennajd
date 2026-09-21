@@ -5,7 +5,7 @@
 // Run with: npx vitest run src/hooks/use-ennajd-state.test.ts
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { isPaymentFullyPaid } from "../lib/ennajd-billing";
+import { getPaymentRemaining, isPaymentFullyPaid } from "../lib/ennajd-billing";
 import { useEnnajdState } from "./use-ennajd-state";
 import type {
   AttendanceRecord,
@@ -37,7 +37,8 @@ const STUDENT: Student = {
 };
 
 // Tue + Thu recurring Math slots for T.C Large (8 sessions/month → perSession
-// = 350 / 8 = 43.75).
+// = 350 / 8 = 43.75). fixedCount = 8, so a student who attends all eight
+// bills the full 350 MAD and Month 2 is full too.
 const SESSIONS: Session[] = [
   {
     id: "session-math-tue",
@@ -183,12 +184,18 @@ function seedRuleALedger(payments: Payment[], advanceBalance = 0) {
   });
 }
 
+/**
+ * A ledger row. `isPaid` is EXPLICIT — credit on a month (`amountPaid`
+ * reaching `amountDue`) never settles it. Pass `true` only for rows the user
+ * has settled with the ✓ action.
+ */
 function payment(
   id: string,
   dueDate: string,
   amountDue: number,
   rule: Payment["rule"] = "A",
   amountPaid = 0,
+  isPaid = false,
 ): Payment {
   return {
     id,
@@ -196,7 +203,7 @@ function payment(
     subject: "Math",
     dueDate,
     month: dueDate.slice(0, 7),
-    isPaid: amountPaid >= amountDue,
+    isPaid,
     amountDue,
     amountPaid,
     isHalfMonth: false,
@@ -212,6 +219,7 @@ function paymentFor(
   dueDate: string,
   amountDue: number,
   amountPaid = 0,
+  isPaid = false,
 ): Payment {
   return {
     id,
@@ -219,7 +227,7 @@ function paymentFor(
     subject,
     dueDate,
     month: dueDate.slice(0, 7),
-    isPaid: amountPaid >= amountDue,
+    isPaid,
     amountDue,
     amountPaid,
     isHalfMonth: false,
@@ -273,6 +281,188 @@ function expectOneRowPerMonth() {
   for (const m of months) counts.set(m, (counts.get(m) ?? 0) + 1);
   for (const count of counts.values()) expect(count).toBe(1);
 }
+
+// ---------------------------------------------------------------------------//
+// THE MASTER BILLING & PRORATION CONTRACT — the four mandated end-to-end
+// scenarios. Rule A, 350 MAD/month, Tue+Thu (fixedCount = 8,
+// perSession = 43.75):
+//   Month 1 = full 350 when sessionCount >= 8 (or joined from session 1),
+//             else floorMAD(sessionCount × 43.75)
+//   Month 2 = 350 when Month 1 was full, else the 350 − Month 1 complement
+//   Month 3+ = 350
+// Green is EXPLICIT — every month starts and stays RED until the user settles
+// it, no matter how much credit sits on it.
+// ---------------------------------------------------------------------------//
+
+/**
+ * Seeds a hydrated, pre-sync ledger. Attendance starts EMPTY — the contract
+ * tests create their own anchors with `markSessions` so each one controls the
+ * student's first-attendance date exactly.
+ */
+function seedContractLedger(payments: Payment[] = []) {
+  resetStore();
+  useEnnajdState.setState({
+    students: [{ ...STUDENT }],
+    sessions: SESSIONS,
+    prices: PRICES,
+    payments,
+    hasSyncedPayments: true,
+    isDataReady: true,
+    lastPaymentsSyncDateKey: TODAY_KEY,
+  });
+}
+
+/**
+ * September 2026's Tue/Thu schedule (9 occurrences; the 5th weekly one is
+ * free — the billable cap is fixedCount = 8).
+ */
+const SEP_2026_DATES = [
+  "2026-09-01", "2026-09-03", "2026-09-08", "2026-09-10",
+  "2026-09-15", "2026-09-17", "2026-09-22", "2026-09-24", "2026-09-29",
+];
+
+/**
+ * Marks the given September dates PRESENT, flushing the reactive ledger after
+ * each one. The student's FIRST PRESENT attendance is the billing anchor, so
+ * the sequence of dates determines Month 1's invoice exactly.
+ */
+async function markSessions(dates: string[]) {
+  const store = useEnnajdState.getState();
+  for (const date of dates) {
+    const isTue = new Date(date + "T12:00:00").getDay() === 2;
+    await store.markAttendance(
+      STUDENT_ID,
+      isTue ? "session-math-tue" : "session-math-thu",
+      date,
+      "present",
+    );
+    await flushReactive();
+  }
+}
+
+describe("master billing & proration contract — Rule A (350 MAD, 8 sessions)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  it("(1) a student starting from session 1 with 8 sessions bills 350 / 350, both RED", async () => {
+    // The student attends every Tue/Thu session of September from the 1st —
+    // the full fixedCount. Month 1 is the FULL monthly price (350, never a
+    // prorated fraction) and Month 2 is full too, because Month 1 consumed
+    // the whole first monthly price. Neither is settled by the marks.
+    seedContractLedger();
+    await markSessions(SEP_2026_DATES.slice(0, 8));
+
+    const ledger = ledgerByMonth();
+    const sept = ledger.get("2026-09")!;
+    const oct = ledger.get("2026-10")!;
+    expect(sept).toBeDefined();
+    expect(oct).toBeDefined();
+
+    expect(sept.amountDue).toBe(350);
+    expect(sept.isPaid).toBe(false);
+    expect(sept.amountPaid).toBe(0);
+    expect(isPaymentFullyPaid(sept)).toBe(false);
+
+    expect(oct.amountDue).toBe(350);
+    expect(oct.isPaid).toBe(false);
+    expect(oct.amountPaid).toBe(0);
+    expect(isPaymentFullyPaid(oct)).toBe(false);
+
+    // Month 3 onwards locks to the full price.
+    expect(ledger.get("2026-11")!.amountDue).toBe(350);
+
+    expectOneRowPerMonth();
+  });
+
+  it("(2) a student attending 3 sessions bills 131 / 219, both RED", async () => {
+    // The student's first attendance is the 6th scheduled session, leaving 3
+    // billable sessions in September: 3 × 43.75 = 131.25 → floorMAD = 131 for
+    // Month 1. Month 2 carries the complement 350 − 131 = 219. Both stay RED
+    // — the marks prove delivery, they never settle a month.
+    seedContractLedger();
+    await markSessions(["2026-09-22", "2026-09-24", "2026-09-29"]);
+
+    const ledger = ledgerByMonth();
+    const sept = ledger.get("2026-09")!;
+    const oct = ledger.get("2026-10")!;
+
+    expect(sept.amountDue).toBe(131);
+    expect(sept.isPaid).toBe(false);
+    expect(sept.amountPaid).toBe(0);
+    expect(isPaymentFullyPaid(sept)).toBe(false);
+
+    expect(oct.amountDue).toBe(219);
+    expect(oct.isPaid).toBe(false);
+    expect(oct.amountPaid).toBe(0);
+    expect(isPaymentFullyPaid(oct)).toBe(false);
+
+    expectOneRowPerMonth();
+  });
+
+  it("(3) updating attendance from 3 → 8 sessions immediately reprices to 350 / 350", async () => {
+    // THE FROZEN-AMOUNT FIX: the 3-session state holds 131 / 219. Adding the
+    // five earlier September marks moves the anchor to the 1st, so the
+    // reactive recalc re-derives the ledger LIVE — Month 1 jumps to the full
+    // 350 and Month 2, no longer a complement, becomes the full 350 too. No
+    // manual recalc, no page refresh.
+    seedContractLedger();
+    await markSessions(["2026-09-22", "2026-09-24", "2026-09-29"]);
+    let ledger = ledgerByMonth();
+    expect(ledger.get("2026-09")!.amountDue).toBe(131);
+    expect(ledger.get("2026-10")!.amountDue).toBe(219);
+
+    await markSessions(["2026-09-01", "2026-09-03", "2026-09-08", "2026-09-10", "2026-09-15"]);
+    ledger = ledgerByMonth();
+    const sept = ledger.get("2026-09")!;
+    const oct = ledger.get("2026-10")!;
+
+    expect(sept.amountDue).toBe(350);
+    expect(oct.amountDue).toBe(350);
+    expect(sept.isPaid).toBe(false);
+    expect(oct.isPaid).toBe(false);
+
+    // The reprice reached Supabase — the batch upsert carries the new 350
+    // amounts (a frozen ledger would still ship 131 / 219).
+    const shipped = await upsertedRows();
+    expect(shipped.filter((p) => p.month === "2026-09").some((p) => p.amountDue === 350))
+      .toBe(true);
+    expect(shipped.filter((p) => p.month === "2026-10").some((p) => p.amountDue === 350))
+      .toBe(true);
+
+    expectOneRowPerMonth();
+  });
+
+  it("(4) settling Month 1 turns ONLY Month 1 green — Month 2 stays red", async () => {
+    // THE GREEN MONTH-2 FIX: the 3-session ledger is 131 / 219. Settling
+    // September flips it green alone; October keeps its 219 due, no credit,
+    // and stays RED — it is never auto-settled and never counts toward the
+    // settled total.
+    seedContractLedger();
+    await markSessions(["2026-09-22", "2026-09-24", "2026-09-29"]);
+    const septId = ledgerByMonth().get("2026-09")!.id;
+
+    const ok = await useEnnajdState.getState().setPaymentPaid(septId, true);
+    expect(ok).toBe(true);
+    await flushReactive();
+
+    const after = ledgerByMonth();
+    const sept = after.get("2026-09")!;
+    const oct = after.get("2026-10")!;
+
+    expect(sept.isPaid).toBe(true);
+    expect(isPaymentFullyPaid(sept)).toBe(true);
+    expect(sept.amountDue).toBe(131); // unchanged by the settlement
+    // Month 2: still 219, still unsettled, still owing everything.
+    expect(oct.isPaid).toBe(false);
+    expect(isPaymentFullyPaid(oct)).toBe(false);
+    expect(oct.amountDue).toBe(219);
+    expect(getPaymentRemaining(oct)).toBe(219);
+  });
+});
 
 describe("reactive ledger — markAttendance trigger", () => {
   beforeEach(() => {
@@ -357,7 +547,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     // amountDue, its payment and its green status; October is re-priced to
     // the 175 complement (350 − 175) but carries no credit.
     seedRuleALedger([
-      payment("sept", "2026-09-15", 350, "A", 350),
+      payment("sept", "2026-09-15", 350, "A", 350, true),
       payment("oct", "2026-10-01", 350),
     ]);
 
@@ -385,7 +575,7 @@ describe("reactive ledger — markAttendance trigger", () => {
     // last 18 lands on December as green advance credit.
     seedRuleALedger(
       [
-        payment("sept", "2026-09-15", 218, "A", 218),
+        payment("sept", "2026-09-15", 218, "A", 218, true),
         payment("oct", "2026-10-01", 350),
       ],
       500, // advanceBalance
@@ -401,10 +591,14 @@ describe("reactive ledger — markAttendance trigger", () => {
     expect(ledger.get("2026-09")!.amountPaid).toBe(218); // untouched
     expect(ledger.get("2026-10")!.amountDue).toBe(132); // the complement
     expect(ledger.get("2026-10")!.amountPaid).toBe(132); // wallet covered it
-    expect(ledger.get("2026-10")!.isPaid).toBe(true);
+    // SETTLEMENT IS EXPLICIT: the wallet covered October exactly, but it is
+    // NOT green — nothing is owed, yet it was never settled by the user.
+    expect(ledger.get("2026-10")!.isPaid).toBe(false);
+    expect(getPaymentRemaining(ledger.get("2026-10")!)).toBe(0);
     expect(ledger.get("2026-11")!.amountDue).toBe(350);
-    expect(ledger.get("2026-11")!.amountPaid).toBe(350); // green
-    expect(ledger.get("2026-11")!.isPaid).toBe(true);
+    expect(ledger.get("2026-11")!.amountPaid).toBe(350); // covered
+    expect(ledger.get("2026-11")!.isPaid).toBe(false);
+    expect(getPaymentRemaining(ledger.get("2026-11")!)).toBe(0);
     // The generation horizon (now + 1 month) reaches December, so the 18
     // tail lands on it instead of parking in the wallet.
     expect(ledger.get("2026-12")!.amountDue).toBe(350);
@@ -443,7 +637,7 @@ describe("reactive ledger — markAttendance trigger", () => {
 
   it("confirms the recalc with a toast naming the student", async () => {
     seedRuleALedger([
-      payment("sept", "2026-09-15", 350, "A", 350),
+      payment("sept", "2026-09-15", 350, "A", 350, true),
       payment("oct", "2026-10-01", 350),
     ]);
 
@@ -646,7 +840,7 @@ describe("regeneratePaymentLedger", () => {
     // it is never part of the delete batch nor the rebuild. Only the
     // unsettled October row is deleted and regenerated.
     seedRuleALedger([
-      payment("sept", "2026-09-15", 218, "A", 218), // settled
+      payment("sept", "2026-09-15", 218, "A", 218, true), // settled
       payment("oct", "2026-10-01", 350), // unsettled
     ]);
 
@@ -714,10 +908,14 @@ describe("recordPartialPayment — waterfall", () => {
 
     const ledger = ledgerByMonth();
     expect(ledger.get("2026-09")!.amountPaid).toBe(175);
-    expect(isPaymentFullyPaid(ledger.get("2026-09")!)).toBe(true);
+    // SETTLEMENT IS EXPLICIT: the wallet covered September exactly, but the
+    // month is not green — nothing is owed, yet it was never user-settled.
+    expect(isPaymentFullyPaid(ledger.get("2026-09")!)).toBe(false);
+    expect(getPaymentRemaining(ledger.get("2026-09")!)).toBe(0);
     expect(ledger.get("2026-10")!.amountPaid).toBe(175);
     expect(ledger.get("2026-10")!.amountDue).toBe(175);
-    expect(ledger.get("2026-10")!.isPaid).toBe(true);
+    expect(ledger.get("2026-10")!.isPaid).toBe(false);
+    expect(getPaymentRemaining(ledger.get("2026-10")!)).toBe(0);
     // November untouched — the waterfall stops when the credit runs out.
     expect(ledger.get("2026-11")!.amountPaid).toBe(0);
 
@@ -738,7 +936,7 @@ describe("recordPartialPayment — waterfall", () => {
     const oct = (await upsertedRows()).find((p) => p.id === "oct");
     expect(oct).toBeDefined();
     expect(oct!.amountPaid).toBe(175);
-    expect(oct!.isPaid).toBe(true);
+    expect(oct!.isPaid).toBe(false); // credit, not a settlement
     // No id ships twice in the batch.
     const ids = (await upsertedRows()).map((p) => p.id);
     expect(ids).toEqual([...new Set(ids)]);
@@ -749,10 +947,10 @@ describe("recordPartialPayment — waterfall", () => {
     // the generation horizon are settled), the credit can be absorbed by
     // nothing and must land in the wallet.
     seedRuleALedger([
-      payment("sept", "2026-09-15", 350, "A", 350),
-      payment("oct", "2026-10-01", 350, "A", 350),
-      payment("nov", "2026-11-01", 350, "A", 350),
-      payment("dec", "2026-12-01", 350, "A", 350),
+      payment("sept", "2026-09-15", 350, "A", 350, true),
+      payment("oct", "2026-10-01", 350, "A", 350, true),
+      payment("nov", "2026-11-01", 350, "A", 350, true),
+      payment("dec", "2026-12-01", 350, "A", 350, true),
     ]);
 
     await useEnnajdState
@@ -875,14 +1073,14 @@ describe("applyInitialTuitionPayment — single-write cross-subject waterfall", 
     // Every installment through the generation horizon is already settled, so
     // the waterfall has no gap and the whole payment must survive as surplus.
     seedCrossSubjectLedger([
-      paymentFor("Math", "m-sept", "2026-09-15", 350, 350),
-      paymentFor("Math", "m-oct", "2026-10-01", 350, 350),
-      paymentFor("Math", "m-nov", "2026-11-01", 350, 350),
-      paymentFor("Math", "m-dec", "2026-12-01", 350, 350),
-      paymentFor("PC", "p-sept", "2026-09-15", 350, 350),
-      paymentFor("PC", "p-oct", "2026-10-01", 350, 350),
-      paymentFor("PC", "p-nov", "2026-11-01", 350, 350),
-      paymentFor("PC", "p-dec", "2026-12-01", 350, 350),
+      paymentFor("Math", "m-sept", "2026-09-15", 350, 350, true),
+      paymentFor("Math", "m-oct", "2026-10-01", 350, 350, true),
+      paymentFor("Math", "m-nov", "2026-11-01", 350, 350, true),
+      paymentFor("Math", "m-dec", "2026-12-01", 350, 350, true),
+      paymentFor("PC", "p-sept", "2026-09-15", 350, 350, true),
+      paymentFor("PC", "p-oct", "2026-10-01", 350, 350, true),
+      paymentFor("PC", "p-nov", "2026-11-01", 350, 350, true),
+      paymentFor("PC", "p-dec", "2026-12-01", 350, 350, true),
     ]);
 
     await useEnnajdState
@@ -964,15 +1162,18 @@ function seedWalletLedger(payments: Payment[], advanceBalance: number) {
   });
 }
 
-/** A Rule B installment: 500 MAD due on the 15th of `month`. */
-function ruleBPayment(id: string, month: string, amountPaid = 0): Payment {
+/**
+ * A Rule B installment: 500 MAD due on the 15th of `month`. `isPaid` is
+ * explicit — credit never settles a month.
+ */
+function ruleBPayment(id: string, month: string, amountPaid = 0, isPaid = false): Payment {
   return {
     id,
     studentId: STUDENT_ID,
     subject: "Math",
     dueDate: `${month}-15`,
     month,
-    isPaid: amountPaid >= 500,
+    isPaid,
     amountDue: 500,
     amountPaid,
     isHalfMonth: false,
@@ -995,9 +1196,9 @@ describe("syncPayments — wallet carryover to the next month", () => {
     // new row: December — and the wallet credit must land on it.
     seedWalletLedger(
       [
-        ruleBPayment("b-sept", "2026-09", 500),
-        ruleBPayment("b-oct", "2026-10", 500),
-        ruleBPayment("b-nov", "2026-11", 500),
+        ruleBPayment("b-sept", "2026-09", 500, true),
+        ruleBPayment("b-oct", "2026-10", 500, true),
+        ruleBPayment("b-nov", "2026-11", 500, true),
       ],
       WALLET,
     );
@@ -1037,9 +1238,9 @@ describe("syncPayments — wallet carryover to the next month", () => {
     // unpaid December row through the per-id UPDATE path alone.
     seedWalletLedger(
       [
-        ruleBPayment("b-sept", "2026-09", 500),
-        ruleBPayment("b-oct", "2026-10", 500),
-        ruleBPayment("b-nov", "2026-11", 500),
+        ruleBPayment("b-sept", "2026-09", 500, true),
+        ruleBPayment("b-oct", "2026-10", 500, true),
+        ruleBPayment("b-nov", "2026-11", 500, true),
         ruleBPayment("b-dec", "2026-12", 0),
       ],
       WALLET,
@@ -1076,10 +1277,10 @@ describe("syncPayments — wallet carryover to the next month", () => {
     // sync, and nothing must be written.
     seedWalletLedger(
       [
-        ruleBPayment("b-sept", "2026-09", 500),
-        ruleBPayment("b-oct", "2026-10", 500),
-        ruleBPayment("b-nov", "2026-11", 500),
-        ruleBPayment("b-dec", "2026-12", 500),
+        ruleBPayment("b-sept", "2026-09", 500, true),
+        ruleBPayment("b-oct", "2026-10", 500, true),
+        ruleBPayment("b-nov", "2026-11", 500, true),
+        ruleBPayment("b-dec", "2026-12", 500, true),
       ],
       WALLET,
     );

@@ -70,14 +70,12 @@ export function PaymentsPreviewTable({ matrix, lang, subject }: PaymentsPreviewT
                             type="button"
                             className={cn(
                               "inline-flex items-center gap-0.5 rounded-lg px-2 py-1 text-xs font-semibold ring-1 ring-transparent transition hover:ring-primary/40",
-                              cell.isPaid || cell.advanceCredit > 0
+                              cell.isPaid
                                 ? "bg-success/15 text-success"
                                 : "bg-destructive/10 text-destructive",
                             )}
                           >
-                            {cell.isPaid || cell.advanceCredit === 0
-                              ? cell.amountDue
-                              : cell.advanceCredit}
+                            {cell.amountDue}
                             {cell.isDiscounted && <span className="text-accent">*</span>}
                           </button>
                         </PaymentCellPopover>
@@ -86,8 +84,8 @@ export function PaymentsPreviewTable({ matrix, lang, subject }: PaymentsPreviewT
                     </Tooltip>
                     {!cell.isPaid && cell.advanceCredit > 0 && (
                       <div className="mt-1 flex flex-col items-center gap-0.5">
-                        <span className="inline-flex whitespace-nowrap rounded-full bg-success/15 px-1.5 text-[9px] font-bold text-success">
-                          {t("advanceCreditBadge")}
+                        <span className="inline-flex whitespace-nowrap rounded-full bg-accent/15 px-1.5 text-[9px] font-bold text-accent-foreground">
+                          {t("advanceCreditBadge")} {cell.advanceCredit}
                         </span>
                         <p className="whitespace-nowrap text-[10px] font-bold text-muted-foreground">
                           {t("remainingAmount")} {cell.remaining}

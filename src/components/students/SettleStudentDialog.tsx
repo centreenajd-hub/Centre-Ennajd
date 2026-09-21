@@ -44,9 +44,11 @@ export function SettleStudentDialog({ student, disabled, trigger }: SettleStuden
     const byDueDate = (a: { dueDate: string; subject: string }, b: { dueDate: string; subject: string }) =>
       a.dueDate.localeCompare(b.dueDate) || a.subject.localeCompare(b.subject);
     const remaining = all
-      .filter((p) => !p.isPaid && p.dueDate <= todayKey)
+      .filter((p) => !p.isPaid && p.dueDate <= todayKey && getPaymentRemaining(p) > 0)
       .sort(byDueDate);
-    const upcoming = all.filter((p) => !p.isPaid && p.dueDate > todayKey).sort(byDueDate);
+    const upcoming = all
+      .filter((p) => !p.isPaid && p.dueDate > todayKey && getPaymentRemaining(p) > 0)
+      .sort(byDueDate);
     const totalDefined = all.reduce((sum, p) => sum + p.amountDue, 0);
     // "Paid" counts what was actually covered: settled installments at full
     // amount plus every partial amountPaid on still-outstanding installments.

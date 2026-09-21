@@ -35,7 +35,7 @@ import { StudentReceiptDialog } from "@/components/reports/StudentReceiptDialog"
 import { RegistrationFeeBadge } from "@/components/payments/RegistrationFeeBadge";
 import { SettleStudentDialog } from "@/components/students/SettleStudentDialog";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { formatDateKey, getPaymentRemaining, isPaymentFullyPaid } from "@/lib/ennajd-billing";
+import { formatDateKey, getPaymentRemaining } from "@/lib/ennajd-billing";
 import { isGroupTypeApplicable } from "@/lib/ennajd-taxonomy";
 import { useI18n } from "@/lib/i18n";
 import { getPageNumbers } from "@/lib/pagination";
@@ -227,11 +227,10 @@ export function StudentTable({ students, onEdit, emptyState }: StudentTableProps
       // fully-paid student.
       if (payment.dueDate <= todayKey) {
         entry.dueInstallmentCount += 1;
-        // Explicit future exclusion: only past-due installments count toward Reste
-        // Use isPaymentFullyPaid for consistency with aggregateOverdueInstallments /\
-        // getDueBalanceForStudentSubject — an installment counts as owed only when
-        // neither the isPaid flag nor amountPaid covers amountDue.
-        if (!isPaymentFullyPaid(payment)) {
+        // Explicit future exclusion: only past-due installments count toward
+        // Reste, and only while a real gap remains — credit already covering
+        // the month means nothing is owed (settlement is the explicit flag).
+        if (!payment.isPaid) {
           const remaining = getPaymentRemaining(payment);
           if (remaining > 0) entry.remaining += remaining;
         }

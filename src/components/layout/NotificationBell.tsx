@@ -185,8 +185,13 @@ export function NotificationBell() {
     // Orphan guard: ignore payments whose student doc no longer exists.
     // After a console wipe where students is cleared but payments still lingers
     // in the IndexedDB cache, this prevents the badge from counting stale orphans.
+    // A month whose credit covers it owes nothing — never a debtor.
     const overdue = payments.filter(
-      (p) => !p.isPaid && p.dueDate < todayKey && studentsById.has(p.studentId),
+      (p) =>
+        !p.isPaid &&
+        p.dueDate < todayKey &&
+        studentsById.has(p.studentId) &&
+        getPaymentRemaining(p) > 0,
     );
     const smallGroup: Payment[] = [];
     const general: Payment[] = [];

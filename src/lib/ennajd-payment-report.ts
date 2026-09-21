@@ -28,7 +28,8 @@ export interface PaymentCell {
   /** True when at least one installment is fully or partially counted as paid. */
   isPartiallyPaid: boolean;
   /** MAD of pre-paid/advance credit sitting on this month (amountPaid when
-   *  the month is not fully covered, 0 otherwise) — the green chip value. */
+   *  the month is not fully covered, 0 otherwise). Shown as a neutral chip —
+   *  credit never makes the month green (only the settlement flag does). */
   advanceCredit: number;
   /** MAD still owed for this month (amountDue - amountPaid). */
   remaining: number;
@@ -141,11 +142,10 @@ export function buildPaymentMatrix(
         monthPayments.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0),
       );
       const remaining = Math.max(0, roundMAD(amountDue - amountPaid));
-      // A month is "fully paid" only when every installment is covered —
-      // an amountPaid that doesn't reach amountDue keeps it unpaid.
-      const isPaid = monthPayments.every(
-        (p) => p.isPaid || (p.amountPaid ?? 0) >= p.amountDue,
-      );
+      // A month is GREEN only when every installment is EXPLICITLY settled —
+      // wallet credit covering it (amountPaid >= amountDue) keeps it red:
+      // the "Green Month 2" rule. Nothing-owed is `remaining <= 0`.
+      const isPaid = monthPayments.every((p) => p.isPaid);
       const isPartiallyPaid = !isPaid && amountPaid > 0;
       const isHalfMonth = monthPayments.some((p) => p.isHalfMonth);
       // Only a genuine customPrice (or a stale row) moves the amount off the

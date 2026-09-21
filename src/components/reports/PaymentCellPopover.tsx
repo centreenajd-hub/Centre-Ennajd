@@ -38,9 +38,10 @@ interface PaymentCellPopoverProps {
   children: React.ReactNode;
 }
 
-/** App-wide settled semantics: flag OR paid credit covering the amount. */
-function isSettled(payment: { isPaid: boolean; amountDue: number; amountPaid?: number }): boolean {
-  return payment.isPaid || (payment.amountPaid ?? 0) >= payment.amountDue;
+/** App-wide settled semantics: the EXPLICIT settlement flag only. Wallet
+ *  credit covering a month never settles it (the "Green Month 2" rule). */
+function isSettled(payment: { isPaid: boolean }): boolean {
+  return payment.isPaid;
 }
 
 export function PaymentCellPopover({
@@ -123,7 +124,7 @@ export function PaymentCellPopover({
                         {t("paid")}
                       </Badge>
                     ) : partial ? (
-                      <Badge className="gap-1 rounded-full bg-success/15 px-2 text-[10px] font-bold text-success">
+                      <Badge className="gap-1 rounded-full bg-accent/15 px-2 text-[10px] font-bold text-accent-foreground">
                         {t("advanceCreditBadge")} · {t("remainingAmount")} {remaining}
                       </Badge>
                     ) : (

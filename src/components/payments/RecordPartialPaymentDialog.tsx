@@ -57,7 +57,9 @@ export function RecordPartialPaymentDialog({
 
   const todayKey = formatDateKey(new Date());
 
-  // Same "due" definition as the rest of the app: unpaid and dueDate <= today.
+  // Same "due" definition as the rest of the app: unpaid, dueDate <= today,
+  // and a real remaining gap (credit that already covers the month means
+  // nothing is there to collect).
   const due = useMemo(() => {
     return payments
       .filter(
@@ -65,7 +67,8 @@ export function RecordPartialPaymentDialog({
           p.studentId === student.id &&
           p.subject === subject &&
           !p.isPaid &&
-          p.dueDate <= todayKey,
+          p.dueDate <= todayKey &&
+          getPaymentRemaining(p) > 0,
       )
       .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
   }, [payments, student.id, subject, todayKey]);

@@ -21,7 +21,6 @@ import { useEnnajdState } from "@/hooks/use-ennajd-state";
 import {
   getDueBalanceForStudentSubject,
   getPaymentRemaining,
-  isPaymentFullyPaid,
 } from "@/lib/ennajd-billing";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -49,10 +48,13 @@ function formatMonthLabel(monthKey: string): string {
   return m && y ? `${m}/${y}` : monthKey;
 }
 
-type InstallmentStatus = "paid" | "unpaid" | "overdue";
+type InstallmentStatus = "paid" | "covered" | "unpaid" | "overdue";
 
 function statusOf(payment: Payment, todayKey: string): InstallmentStatus {
-  if (isPaymentFullyPaid(payment)) return "paid";
+  // Only the explicit flag settles a month. Credit covering it leaves
+  // nothing owed — "covered" — but it is not a settlement record.
+  if (payment.isPaid) return "paid";
+  if (getPaymentRemaining(payment) <= 0) return "covered";
   if (payment.dueDate < todayKey) return "overdue";
   return "unpaid";
 }
@@ -160,14 +162,17 @@ export function SmallGroupPaymentHistoryDialog({
                         className={cn(
                           "rounded-full",
                           status === "paid" && "bg-success text-white",
+                          status === "covered" && "bg-accent/15 text-accent-foreground",
                           status === "unpaid" && "bg-amber-500/15 text-amber-700 dark:text-amber-300",
                         )}
                       >
                         {status === "paid"
                           ? t("installmentStatusPaid")
-                          : status === "overdue"
-                            ? t("installmentStatusOverdue")
-                            : t("installmentStatusUnpaid")}
+                          : status === "covered"
+                            ? t("advanceCreditBadge")
+                            : status === "overdue"
+                              ? t("installmentStatusOverdue")
+                              : t("installmentStatusUnpaid")}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right">
@@ -179,6 +184,17 @@ export function SmallGroupPaymentHistoryDialog({
                           onClick={() => handleUndo(payment.id)}
                         >
                           ↻ {t("correctCancel")}
+                        </Button>
+                      ) : status === "covered" ? (
+                        // Nothing is owed; the month can still be marked
+                        // explicitly settled on demand.
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="rounded-full"
+                          onClick={() => handleSettle(payment.id)}
+                        >
+                          ✓ {t("settlePayment")}
                         </Button>
                       ) : (
                         <Button

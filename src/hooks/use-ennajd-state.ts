@@ -1425,8 +1425,11 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const asOfKey = formatDateKey(asOf);
     const updatedAt = new Date().toISOString();
 
-    const isSettled = (p: Payment) =>
-      p.isPaid || (p.amountPaid ?? 0) >= p.amountDue;
+    // Settlement is the explicit flag only — credit covering a month
+    // (amountPaid >= amountDue) is NOT a settlement. The undo walk still
+    // reads the credit back off such a month (its capacity is its paid
+    // credit), so nothing is stranded.
+    const isSettled = (p: Payment) => p.isPaid;
     const remainingOf = (p: Payment) =>
       Math.max(0, p.amountDue - (p.amountPaid ?? 0));
 
@@ -1464,7 +1467,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         if (remaining <= 0) continue;
         const apply = Math.min(remaining, credit);
         const amountPaid = (payment.amountPaid ?? 0) + apply;
-        applyPatch(payment, amountPaid, amountPaid >= payment.amountDue);
+        // Credit never settles — only the explicit ✓ action does.
+        applyPatch(payment, amountPaid, false);
         credit -= apply;
       }
     } else {
@@ -1555,11 +1559,10 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
   /**
    * Manual "recalculate installments" action — deletes every Rule A row and
    * rebuilds it from scratch, keeping Rule B rows untouched. Payment progress
-   * is preserved per (student, subject, month). Rows carrying a recorded
-   * settlement (status = 'paid' or amount_paid > 0) are ALSO kept untouched —
-   * a settled month never reverts to red from a recalculation. Callers ask
-   * the user to confirm first — the whole unsettled Rule A ledger is
-   * rewritten.
+   * is preserved per (student, subject, month). Rows carrying an explicit
+   * settlement (status = 'paid') are ALSO kept untouched — a settled month
+   * never reverts to red from a recalculation. Callers ask the user to
+   * confirm first — the whole unsettled Rule A ledger is rewritten.
    */
   regeneratePaymentLedger: async () => {
     // Manual full rebuild — refuse to run against a half-hydrated store.
@@ -1569,7 +1572,7 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     const previousPayments = get().payments;
     const previousStudents = get().students;
 
-    // SETTLEMENT PROTECTION — the months carrying a recorded settlement are
+    // SETTLEMENT PROTECTION — the months carrying an explicit settlement are
     // kept verbatim (they join `existingKeys` below, so the generator skips
     // them and can never mint a duplicate for that month).
     const ruleAMonthKey = (p: Payment) =>
@@ -1615,14 +1618,10 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       for (const payment of generated) {
         const paidKey = `${payment.studentId}__${payment.subject}__${payment.month}`;
         const carriedPaid = Math.min(paidByMonth.get(paidKey) ?? 0, payment.amountDue);
+        // Carried credit is preserved on the rebuilt row, but it never
+        // settles the month — only an explicit ✓ action does.
         rebuilt.push(
-          carriedPaid > 0
-            ? {
-                ...payment,
-                amountPaid: carriedPaid,
-                isPaid: carriedPaid >= payment.amountDue,
-              }
-            : payment,
+          carriedPaid > 0 ? { ...payment, amountPaid: carriedPaid } : payment,
         );
       }
     }
@@ -1754,7 +1753,8 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
         p.studentId === studentId &&
         p.subject === subject &&
         !p.isPaid &&
-        p.dueDate <= asOfKey,
+        p.dueDate <= asOfKey &&
+        p.amountDue - (p.amountPaid ?? 0) > 0,
     );
     if (candidates.length === 0) return undefined;
     return candidates.reduce((earliest, p) =>

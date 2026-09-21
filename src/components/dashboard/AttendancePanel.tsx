@@ -66,7 +66,9 @@ export default function AttendancePanel({ session, date, now }: AttendancePanelP
   const outstandingKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const p of payments) {
-      if (!p.isPaid && p.dueDate <= todayKey) {
+      // Credit that already covers the month means nothing is owed, so it
+      // never flags the student as outstanding.
+      if (!p.isPaid && p.dueDate <= todayKey && getPaymentRemaining(p) > 0) {
         keys.add(`${p.studentId}__${p.subject}`);
       }
     }

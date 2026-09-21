@@ -734,20 +734,29 @@ export function isPaymentPartiallyPaid(payment: Payment): boolean {
   return paid > 0 && paid < payment.amountDue && !payment.isPaid;
 }
 
+/**
+ * GREEN ⟺ the explicit settlement flag. Credit landing on a month
+ * (`amountPaid` covering `amountDue`, e.g. a prepaid wallet absorbing the
+ * Month-2 complement) NEVER makes it green — a month is only "paid" when a
+ * user settles it. This is the "Green Month 2" fix: the transition month
+ * stays RED until it is explicitly paid, no matter how much wallet credit
+ * sits on it. Consumers that need "nothing is owed" use
+ * `getPaymentRemaining(p) <= 0` instead.
+ */
 export function isPaymentFullyPaid(payment: Payment): boolean {
-  return payment.isPaid || (payment.amountPaid ?? 0) >= payment.amountDue;
+  return payment.isPaid;
 }
 
 /**
- * Whether a settlement was recorded on this row: the green settled flag
- * (`status = 'paid'`) OR an adjusted balance (`amount_paid > 0`). Such rows
- * are IMMUTABLE — no recalculation, reconcile pass, page reload or manual
- * "Recalculer les échéances" may reset, re-price or delete them. A settled
- * month stays settled forever; its credit stays exactly where the parent
- * put it.
+ * Whether a settlement was recorded on this row — the green settled flag
+ * ONLY. `amount_paid > 0` is no longer a lock: a row whose `isPaid` is false
+ * has ZERO locks and recalculates freely on every attendance change, so a
+ * Month 1 carrying partial credit re-prices from a frozen 131 MAD to its
+ * live 350 MAD the moment attendance moves it. Credit is preserved through
+ * the rebuild (it joins the redistributable pool) — only the freeze is gone.
  */
 export function isSettlementRecorded(payment: Payment): boolean {
-  return payment.isPaid || (payment.amountPaid ?? 0) > 0;
+  return payment.isPaid;
 }
 
 /**
@@ -784,8 +793,10 @@ export interface CreditWaterfallResult {
  * Distributes `credit` (MAD) across the student's not-fully-paid installments
  * in dueDate-ascending order, using the explicit 3-branch waterfall per row:
  *
- * 1. FULLY PAID — `wallet >= monthDueAmount`: the wallet covers the month's
- *    whole remaining gap; the row is settled and the wallet is debited.
+ * 1. FULLY COVERED — `wallet >= monthDueAmount`: the wallet covers the
+ *    month's whole remaining gap; the credit lands in full and the wallet is
+ *    debited. The row is NOT settled — settlement is an explicit user act
+ *    (`setPaymentPaid`); the month owes nothing but stays RED until then.
  * 2. PARTIALLY PAID — `0 < wallet < monthDueAmount`: the wallet is fully
  *    absorbed as partial credit on this month (the GREEN advance-credit
  *    chip); the row stays unpaid and the wallet hits 0. Any further surplus
@@ -802,7 +813,7 @@ export interface CreditWaterfallResult {
  *   out. Unabsorbed surplus is returned as `remaining` for `advanceBalance`.
  *
  * This IS the two-month transitional cycle's credit carrier: an enrollment-
- * time full-fee payment settles Month 1 at its floored due and Month 2 at
+ * time full-fee payment COVERS Month 1 at its floored due and Month 2 at
  * its complement (337 + 113 = 450 exactly), with any further surplus landing
  * on the next month as partial credit (branch 2), which `getPaymentsToReceive`
  * then surfaces as that month's complement.
@@ -845,11 +856,15 @@ export function applyCreditWaterfall(
     if (monthDueAmount === 0) continue;
 
     if (remainingWallet >= monthDueAmount) {
-      // Branch 1 — FULLY PAID: the wallet absorbs the month entirely.
+      // Branch 1 — FULLY COVERED: the wallet absorbs the month's whole gap.
+      // SETTLEMENT IS EXPLICIT: the credit lands in full (`amountPaid` =
+      // `amountDue`, so the month owes nothing) but `isPaid` is NOT flipped
+      // — only `setPaymentPaid` may settle a month. A prepaid Month 2 stays
+      // RED and out of the settled Total until the user settles it, and the
+      // row keeps recalculating freely (its lock is `isPaid`, still false).
       updated.push({
         ...payment,
         amountPaid: payment.amountDue,
-        isPaid: true,
         updatedAt,
       });
       remainingWallet -= monthDueAmount;
@@ -1078,9 +1093,10 @@ export function reconcileRuleALedger(
     const keeper = group.rows.reduce((best, p) =>
       isMoreSettledPayment(p, best) ? p : best,
     );
-    // SETTLEMENT PROTECTION: a month whose keeper carries a recorded
-    // settlement (status = 'paid' or amount_paid > 0) is immutable — never
-    // re-priced, re-dated or deleted, even if the engine's expectation moved.
+    // SETTLEMENT PROTECTION: a month whose keeper carries the explicit
+    // settlement flag (status = 'paid') is immutable — never re-priced,
+    // re-dated or deleted, even if the engine's expectation moved. Credit
+    // alone (amount_paid > 0) is not a lock — it is pooled and re-priced.
     if (isSettlementRecorded(keeper)) continue;
     for (const p of group.rows) {
       if (p.id !== keeper.id) del.push(p.id);
@@ -1104,7 +1120,9 @@ export function reconcileRuleALedger(
         amountDue: expected,
         dueDate: expectedDueDate,
         amountPaid: consolidatedPaid,
-        isPaid: consolidatedPaid >= expected,
+        // Settlement is explicit — a self-heal never flips a month green,
+        // even when the consolidated credit now covers it.
+        isPaid: keeper.isPaid,
       });
     }
   }
@@ -1155,7 +1173,7 @@ export function reconcilePaymentAmounts(
     const keeper = group.rows.reduce((best, p) =>
       isMoreSettledPayment(p, best) ? p : best,
     );
-    // SETTLEMENT PROTECTION — a recorded settlement is never re-priced.
+    // SETTLEMENT PROTECTION — an explicit settlement is never re-priced.
     if (isSettlementRecorded(keeper)) continue;
     const expectedDueDate =
       computeExpectedMonthDueDate(inputs.billingStart, group.month) ??
@@ -1171,7 +1189,9 @@ export function reconcilePaymentAmounts(
       amountDue: expected,
       dueDate: expectedDueDate,
       amountPaid: keeperPaid,
-      isPaid: keeperPaid >= expected,
+      // Settlement is explicit — a self-heal never flips a month green,
+      // even when the carried credit now covers it.
+      isPaid: keeper.isPaid,
     });
   }
 
@@ -1245,11 +1265,13 @@ function releaseUnsettled(
  * the rebuild reuses an existing row's id for that month and emits at most
  * one row per key, so a re-mark can never mint a second invoice.
  *
- * SETTLEMENT PROTECTION: months whose rows carry a recorded settlement
- * (`status = 'paid'` or `amount_paid > 0`) are carried through the rebuild
- * verbatim — their id, amountDue, amountPaid and isPaid flag all survive.
- * Their credit is excluded from the redistributable pool, so wallet surplus
- * can only ever land on a month that is not yet settled.
+ * SETTLEMENT PROTECTION: months whose rows carry the explicit settlement
+ * flag (`status = 'paid'`) are carried through the rebuild verbatim — their
+ * id, amountDue, amountPaid and isPaid flag all survive. Their credit is
+ * excluded from the redistributable pool, so wallet surplus can only ever
+ * land on a month that is not yet settled. A row with credit but no
+ * settlement flag is NOT locked: it reprices freely here (its credit is
+ * pooled and re-distributed), which is what lifts the frozen-amount bug.
  *
  * Rule B (every 2Bac Small combo) short-circuits to a no-op — its rolling
  * engine ignores attendance entirely. Pure — no React/Zustand.
@@ -1317,12 +1339,12 @@ export function recalculateStudentSubjectLedger(
     price,
   );
 
-  // SETTLEMENT PROTECTION — a month with a recorded settlement (status =
-  // paid or amount_paid > 0) rides through the rebuild VERBATIM: its id,
-  // amountDue, amountPaid and isPaid flag all survive attendance marks,
-  // page reloads and "Recalculer les échéances". Its credit is NOT part of
-  // the redistributable pool — it is already locked onto that month, so the
-  // waterfall can only move credit that is genuinely free (the wallet).
+  // SETTLEMENT PROTECTION — a month with the explicit settlement flag
+  // (status = paid) rides through the rebuild VERBATIM: its id, amountDue,
+  // amountPaid and isPaid flag all survive attendance marks, page reloads
+  // and "Recalculer les échéances". Its credit is NOT part of the
+  // redistributable pool. A row with credit but no settlement flag is NOT
+  // locked: it joins the pool and reprices — the frozen-amount fix.
   const settledByMonth = new Map<string, Payment>();
   for (const p of existing) {
     if (!isSettlementRecorded(p)) continue;
@@ -1330,9 +1352,10 @@ export function recalculateStudentSubjectLedger(
     if (!current || isMoreSettledPayment(p, current)) settledByMonth.set(p.month, p);
   }
 
-  // The credit pool that is still free to move: the prepaid wallet plus the
-  // payments on months carrying no settlement (by construction those have
-  // amount_paid = 0, so this is exactly the wallet).
+  // The credit pool that is still free to move: the prepaid wallet plus
+  // every `amountPaid` on months that are NOT explicitly settled — credit
+  // follows the student, so a partially-credited Month 1 keeps its money
+  // when the rebuild re-prices it (the frozen-amount fix).
   const creditPool =
     creditOf(existing.filter((p) => !settledByMonth.has(p.month))) +
     (student.advanceBalance ?? 0);
@@ -1445,7 +1468,8 @@ export function getDueBalanceForStudentSubject(
     if (payment.studentId !== studentId || payment.subject !== subject) continue;
     hasInstallments = true;
 
-    if (isPaymentFullyPaid(payment)) {
+    if (payment.isPaid) {
+      // An explicit settlement — the green record.
       if (
         payment.dueDate <= asOfKey &&
         (lastPaidDue === null || payment.dueDate > lastPaidDue.dueDate)
@@ -1454,6 +1478,11 @@ export function getDueBalanceForStudentSubject(
       }
       continue;
     }
+
+    // Covered by credit but not settled: nothing is owed, and it is not a
+    // settlement record either. It counts toward neither the outstanding
+    // balance nor the paid history (never red, never green).
+    if (getPaymentRemaining(payment) <= 0) continue;
 
     // Reste guard: only strictly-due installments count as outstanding.
     if (payment.dueDate <= asOfKey) {
@@ -1489,12 +1518,12 @@ export function getDueBalanceForStudentSubject(
 /**
  * Reste guard helper: the student's outstanding balance across every
  * installment whose dueDate <= todayKey. Future auto-generated months
- * never count.
+ * never count, and a month whose credit already covers it owes nothing.
  */
 export function getResteForPayments(payments: Payment[], todayKey: string): number {
   let reste = 0;
   for (const p of payments) {
-    if (!isPaymentFullyPaid(p) && p.dueDate <= todayKey) {
+    if (p.dueDate <= todayKey && getPaymentRemaining(p) > 0) {
       reste += getPaymentRemaining(p);
     }
   }
@@ -1543,11 +1572,15 @@ export function aggregateOverdueInstallments(
     const key = `${payment.studentId}__${payment.subject}`;
     let row = rows.get(key);
     const paid = payment.amountPaid ?? 0;
+    // A row is a COLLECTION TASK only while it is not settled AND credit has
+    // not covered it: a prepaid month owes nothing, so it never mints a
+    // worklist row (even though its `isPaid` flag is still false).
+    const hasRemainingGap = !payment.isPaid && getPaymentRemaining(payment) > 0;
     // EXPLICIT partial contract: 0 < amountPaid < amountDue ⇒ the month
-    // carries advance credit and is GREEN, whatever its `isPaid` flag.
+    // carries advance credit and is shown as partially paid.
     const isPartiallyPaid = paid > 0 && paid < payment.amountDue;
 
-    if (!isPaymentFullyPaid(payment) && payment.dueDate <= todayKey) {
+    if (hasRemainingGap && payment.dueDate <= todayKey) {
       if (!row) {
         row = {
           studentId: payment.studentId,
@@ -1578,13 +1611,14 @@ export function aggregateOverdueInstallments(
     }
 
     // The NEXT month never joins the due worklist (Reste guard), but its
-    // advance credit is reported on the row so the UI can flag it GREEN.
-    // A future installment only ENRICHES an existing row — a combo with
-    // nothing due today belongs in the settled worklist, not this one.
+    // advance credit is reported on the row so the UI can flag it. A future
+    // installment only ENRICHES an existing row — a combo with nothing due
+    // today belongs in the settled worklist, not this one. A future month
+    // whose credit already covers it has no gap to report either.
     // Note: it never sets the row-level `isPartiallyPaid` — that flag drives
     // the AMOUNT cell, which shows due installments only; the future month's
-    // green is carried by `nextDueAmountPaid` in the next-due cell.
-    if (!isPaymentFullyPaid(payment) && payment.dueDate > todayKey && row) {
+    // credit is carried by `nextDueAmountPaid` in the next-due cell.
+    if (hasRemainingGap && payment.dueDate > todayKey && row) {
       if (row.nextDueDate === null || payment.dueDate < row.nextDueDate) {
         row.nextDueDate = payment.dueDate;
         row.nextDueRemaining = getPaymentRemaining(payment);
@@ -1647,7 +1681,9 @@ export function aggregateSettledInstallments(
     }
 
     if (payment.dueDate <= todayKey) {
-      if (isPaymentFullyPaid(payment)) {
+      if (payment.isPaid) {
+        // An explicit settlement — counts at full price and is the green
+        // record of what the parent paid.
         row.totalCovered += payment.amountDue;
         if (
           row.latestSettledDueDate === null ||
@@ -1656,6 +1692,12 @@ export function aggregateSettledInstallments(
           row.latestSettledDueDate = payment.dueDate;
           row.latestSettledPaymentId = payment.id;
         }
+      } else if (getPaymentRemaining(payment) <= 0) {
+        // Covered by credit but not settled: the parent's money is already
+        // here, so the combo is NOT a collection task — but it is not a
+        // settlement record either. Contribute exactly what was covered;
+        // never report it as the latest settled payment.
+        row.totalCovered += payment.amountPaid ?? 0;
       } else {
         unsettledKeys.add(key);
         rows.delete(key);

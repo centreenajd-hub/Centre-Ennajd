@@ -71,13 +71,11 @@ export function AdjustBalanceDialog({
     [payments, student.id, subject, todayKey],
   );
 
-  // App-wide "remaining" semantics: unpaid = neither isPaid flag nor
-  // amountPaid covering amountDue (matches getPaymentRemaining consumers).
-  const isSettled = (p: (typeof due)[number]) =>
-    p.isPaid || (p.amountPaid ?? 0) >= p.amountDue;
-
+  // Nothing-owed semantics: a settled month and a credit-covered month both
+  // contribute 0 through getPaymentRemaining — only the explicit flag marks
+  // a settlement, so credit never hides a still-collectable gap.
   const currentRemaining = due.reduce(
-    (sum, p) => sum + (isSettled(p) ? 0 : getPaymentRemaining(p)),
+    (sum, p) => sum + getPaymentRemaining(p),
     0,
   );
   const totalDueAmounts = due.reduce((sum, p) => sum + p.amountDue, 0);
