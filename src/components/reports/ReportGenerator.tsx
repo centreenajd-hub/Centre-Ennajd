@@ -39,6 +39,7 @@ export function ReportGenerator() {
   const sessions = useEnnajdState((s) => s.sessions);
   const attendanceRecords = useEnnajdState((s) => s.attendanceRecords);
   const payments = useEnnajdState((s) => s.payments);
+  const prices = useEnnajdState((s) => s.prices);
   const getBasePrice = useEnnajdState((s) => s.getBasePrice);
   // HYDRATION BARRIER — stays false until the atomic initial load has
   // settled every billing dataset. The tables render a skeleton (not
@@ -135,8 +136,9 @@ export function ReportGenerator() {
       matchingSessions,
       attendanceRecords,
       todayKey,
+      prices,
     );
-  }, [scope, subject, students, payments, academicMonths, basePrice, attendanceRecords, todayKey]);
+  }, [scope, subject, students, payments, academicMonths, basePrice, attendanceRecords, todayKey, prices]);
 
   const canGenerate =
     (attendanceChecked || paymentsChecked) && roster.length > 0 && isDataReady;
@@ -166,6 +168,7 @@ export function ReportGenerator() {
         attendanceRecords,
         payments,
         basePrice,
+        prices,
         lang,
         t,
         appName: t("appName"),

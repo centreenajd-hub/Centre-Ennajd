@@ -560,6 +560,64 @@ export function computeMonthInvoice(
 }
 
 /**
+ * The Month-2 carryover facts for the two-month transitional cycle — the
+ * report's display mirror of `computeMonthInvoice`'s carryover branch.
+ *
+ * The billing-start month is prorated (and floored); the unpaid remainder of
+ * that first monthly price, `monthlyPrice − month_1_due` (e.g. 350 − 262 =
+ * 88), is a PREPAID carryover credit — money already collected in Month 1.
+ * The month right after the start month is therefore billed the monthly price
+ * NET of it (`remainingDue`, e.g. 262). This helper reports those facts so the
+ * payment report can display the credit on the transition month before it is
+ * settled.
+ *
+ * Returns `null` unless `monthKey` is exactly the month after `billingStart`
+ * AND the start month was partial (Month 1 due < monthlyPrice) AND both months
+ * are otherwise billable — mirroring the engine's own guards exactly, so the
+ * report can never surface a credit the engine did not actually apply.
+ */
+export interface Month2Carryover {
+  /** The student's full monthly price for this combo (dynamic). */
+  monthlyPrice: number;
+  /** The floored prorated due of the billing-start month (Month 1). */
+  month1Due: number;
+  /** The prepaid carryover credit: `monthlyPrice − month1Due` (e.g. 88). */
+  carryoverCredit: number;
+  /** The outstanding balance still to collect: `monthlyPrice − carryoverCredit` (e.g. 262). */
+  remainingDue: number;
+}
+
+export function getMonth2Carryover(
+  billingStart: Date,
+  monthKey: string,
+  ctx: DeliveredDatesContext,
+  price: number,
+): Month2Carryover | null {
+  const start = normalizeDateOnly(billingStart);
+  const nextKey = formatMonthKey(addMonthsClamped(start, 1));
+  if (monthKey !== nextKey) return null;
+
+  const month1 = monthInvoiceRaw(start, formatMonthKey(start), ctx, price);
+  // Only when BOTH months are otherwise billable does the carryover exist —
+  // a gap month (or any non-billable month) never carries a credit.
+  if (
+    month1 === null ||
+    month1 >= price ||
+    monthInvoiceRaw(start, nextKey, ctx, price) === null
+  ) {
+    return null;
+  }
+
+  const carryoverCredit = price - month1;
+  return {
+    monthlyPrice: price,
+    month1Due: month1,
+    carryoverCredit,
+    remainingDue: price - carryoverCredit,
+  };
+}
+
+/**
  * One month's raw prorated invoice (MAD) under Rule A — the engine's base
  * month math, WITHOUT the Month-2 carryover adjustment. `computeMonthInvoice`
  * wraps this to spread the first monthly price across its two calendar

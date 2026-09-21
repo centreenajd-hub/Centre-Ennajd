@@ -27,6 +27,7 @@ import type {
   GroupType,
   Level,
   Payment,
+  PriceEntry,
   Session,
   Student,
   Subject,
@@ -1114,6 +1115,9 @@ export interface RenderReportOptions {
   attendanceRecords: AttendanceRecord[];
   payments: Payment[];
   basePrice?: number;
+  /** The price table — resolves each student's own monthly price (customPrice
+   *  wins) so the Month-2 carryover credit is never a hardcoded number. */
+  prices?: PriceEntry[];
   lang: LangCode;
   t: (key: DictKey) => string;
   appName: string;
@@ -1174,7 +1178,7 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
       track: options.track,
       groupType: options.groupType,
     });
-    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice, options.sessions, options.attendanceRecords, todayKey);
+    const matrix = buildPaymentMatrix(roster, options.payments, options.subject, months, options.basePrice, options.sessions, options.attendanceRecords, todayKey, options.prices ?? []);
     const yearLabel = `${months[0].year}-${months[months.length - 1].year}`;
     const chunks = chunkRows(matrix.rows, REPORT_ROWS_PER_PAGE);
     const pageChunks: typeof chunks = chunks.length > 0 ? chunks : [[]];
