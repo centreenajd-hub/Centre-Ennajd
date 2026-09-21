@@ -133,7 +133,7 @@ export default function AttendancePanel({ session, date, now }: AttendancePanelP
   // cleared the single earliest installment). Sorted dueDate-ascending so
   // the chronological settlement dependency (Month 1 before Month 2, etc.)
   // is satisfied one installment at a time.
-  function settleOutstanding(studentId: string) {
+  async function settleOutstanding(studentId: string): Promise<void> {
     const dueUnpaid = payments
       .filter(
         (p) =>
@@ -145,7 +145,7 @@ export default function AttendancePanel({ session, date, now }: AttendancePanelP
       )
       .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
     for (const payment of dueUnpaid) {
-      setPaymentPaid(payment.id, true);
+      await setPaymentPaid(payment.id, true);
     }
   }
 
