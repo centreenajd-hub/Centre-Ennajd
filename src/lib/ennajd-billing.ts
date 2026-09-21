@@ -69,8 +69,14 @@ export function roundMAD(amount: number): number {
  * to the whole integer BELOW — 337.5 MAD bills 337 MAD, never 338 or 339.
  * The leftover fraction favors the client/parent and is absorbed by the
  * center; `Math.round`/`Math.ceil` are forbidden for month dues.
+ *
+ * Defensive contract: a missing/non-finite input (a row whose `amount_due`
+ * never resolved, a NaN from an upstream gap) can never reach a parent as a
+ * `NaN` MAD figure — it bills 0 instead of throwing or propagating `NaN`
+ * into the ledger arithmetic.
  */
-export function floorMAD(amount: number): number {
+export function floorMAD(amount: number | null | undefined): number {
+  if (typeof amount !== "number" || !Number.isFinite(amount)) return 0;
   return Math.floor(amount);
 }
 
@@ -91,7 +97,8 @@ function normalizeDateOnly(date: Date): Date {
 }
 
 /** Parses a "YYYY-MM-DD" key into a local-calendar Date (or null when malformed). */
-function parseDateKey(key: string): Date | null {
+function parseDateKey(key: string | null | undefined): Date | null {
+  if (typeof key !== "string" || !key.includes("-")) return null;
   const [y, m, d] = key.split("-");
   const year = Number(y);
   const monthIndex0 = Number(m) - 1;
@@ -356,7 +363,7 @@ export function earliestGroupSessionDate(
   for (const member of getEnrolledStudentsForCombo(students, combo)) {
     const enrollment = member.enrollments.find((e) => e.subject === combo.subject);
     const iso = enrollment?.enrolledAt ?? member.createdAt;
-    const parsed = parseDateKey(iso.slice(0, 10));
+    const parsed = typeof iso === "string" ? parseDateKey(iso.slice(0, 10)) : null;
     if (parsed && (earliest === null || parsed < earliest)) earliest = parsed;
   }
   return earliest;
@@ -581,6 +588,11 @@ function monthInvoiceRaw(
   ctx: DeliveredDatesContext,
   price: number,
 ): number | null {
+  // Defensive: a row with a missing/invalid month key can never throw here —
+  // it simply has no invoice. Guards the reconcile/self-heal paths against
+  // malformed persisted rows.
+  if (typeof monthKey !== "string" || !monthKey.includes("-")) return null;
+
   const fixedCount = getFixedSessionCount(ctx);
   if (fixedCount === 0) return null;
 
@@ -643,6 +655,7 @@ export function computeExpectedMonthDueDate(
   billingStart: Date,
   monthKey: string,
 ): string | null {
+  if (typeof monthKey !== "string" || !monthKey.includes("-")) return null;
   const [yearStr, monthStr] = monthKey.split("-");
   const year = Number(yearStr);
   const monthIndex0 = Number(monthStr) - 1;
@@ -739,7 +752,7 @@ export function generateScheduleFor(
 
 export function getPaymentRemaining(payment: Payment): number {
   const paid = payment.amountPaid ?? 0;
-  return Math.max(0, payment.amountDue - paid);
+  return Math.max(0, (payment.amountDue ?? 0) - paid);
 }
 
 export function isPaymentPartiallyPaid(payment: Payment): boolean {
@@ -850,7 +863,7 @@ export function applyCreditWaterfall(
         (subject === null || p.subject === subject) &&
         !isPaymentFullyPaid(p),
     )
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    .sort((a, b) => (a.dueDate ?? "").localeCompare(b.dueDate ?? ""));
 
   const updated: Payment[] = [];
   let remainingWallet = Math.max(0, Math.round(credit));
@@ -864,7 +877,7 @@ export function applyCreditWaterfall(
     // `computeMonthInvoice`-derived `amountDue` minus already-paid credit.
     const monthDueAmount = Math.max(
       0,
-      payment.amountDue - (payment.amountPaid ?? 0),
+      (payment.amountDue ?? 0) - (payment.amountPaid ?? 0),
     );
     if (monthDueAmount === 0) continue;
 
@@ -877,7 +890,7 @@ export function applyCreditWaterfall(
       // row keeps recalculating freely (its lock is `isPaid`, still false).
       updated.push({
         ...payment,
-        amountPaid: payment.amountDue,
+        amountPaid: payment.amountDue ?? 0,
         updatedAt,
       });
       remainingWallet -= monthDueAmount;
@@ -1591,7 +1604,7 @@ export function aggregateOverdueInstallments(
     const hasRemainingGap = !payment.isPaid && getPaymentRemaining(payment) > 0;
     // EXPLICIT partial contract: 0 < amountPaid < amountDue ⇒ the month
     // carries advance credit and is shown as partially paid.
-    const isPartiallyPaid = paid > 0 && paid < payment.amountDue;
+    const isPartiallyPaid = paid > 0 && paid < (payment.amountDue ?? 0);
 
     if (hasRemainingGap && payment.dueDate <= todayKey) {
       if (!row) {
@@ -1697,7 +1710,7 @@ export function aggregateSettledInstallments(
       if (payment.isPaid) {
         // An explicit settlement — counts at full price and is the green
         // record of what the parent paid.
-        row.totalCovered += payment.amountDue;
+        row.totalCovered += payment.amountDue ?? 0;
         if (
           row.latestSettledDueDate === null ||
           payment.dueDate > row.latestSettledDueDate
@@ -1868,7 +1881,7 @@ export function getPaymentsToReceive(
   for (const payment of earliest.values()) {
     const student = studentsById.get(payment.studentId);
     if (!student) continue;
-    const monthlyPrice = roundMAD(payment.amountDue);
+    const monthlyPrice = roundMAD(payment.amountDue ?? 0);
     const creditCarried = roundMAD(payment.amountPaid ?? 0);
     const complement = Math.max(0, roundMAD(monthlyPrice - creditCarried));
     rows.push({

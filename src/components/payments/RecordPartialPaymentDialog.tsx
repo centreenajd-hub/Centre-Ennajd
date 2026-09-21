@@ -22,7 +22,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { formatDateKey } from "@/lib/ennajd-billing";
+import { formatDateKey, getPaymentRemaining } from "@/lib/ennajd-billing";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { Student, Subject } from "@/types/ennajd";
