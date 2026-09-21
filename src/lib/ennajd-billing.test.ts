@@ -1963,7 +1963,7 @@ describe("recalculateStudentSubjectLedger", () => {
     // Sept is settled (immutable) and the student carries 500 DH of advance
     // credit — the enrollment-time full-fee payment's surplus. The wallet
     // covers October's carryover-adjusted 218 due and lands its remaining
-    // 182 on November as partial credit (68 still owed); nothing parks.
+    // 282 on November as partial credit (68 still owed); nothing parks.
     // No month is settled by this: credit covers October exactly, but they
     // stay RED until the user settles them.
     const existing: Payment[] = [
