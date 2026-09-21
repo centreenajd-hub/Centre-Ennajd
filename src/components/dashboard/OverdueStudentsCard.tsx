@@ -41,19 +41,24 @@ export function OverdueStudentsCard({
 
   // Settle ALL due installments of this student+subject in one tap — same
   // semantics as the Payments page's row-settle and the chip's $ button.
-  function handleSettleAll(studentId: string) {
-    const dueUnpaid = payments.filter(
-      (p) =>
-        p.studentId === studentId &&
-        p.subject === session.subject &&
-        !p.isPaid &&
-        p.dueDate <= todayKey &&
-        getPaymentRemaining(p) > 0,
-    );
+  // Sorted dueDate-ascending so the chronological settlement dependency
+  // (Month 1 before Month 2, etc.) is satisfied one installment at a time.
+  async function handleSettleAll(studentId: string) {
+    const dueUnpaid = payments
+      .filter(
+        (p) =>
+          p.studentId === studentId &&
+          p.subject === session.subject &&
+          !p.isPaid &&
+          p.dueDate <= todayKey &&
+          getPaymentRemaining(p) > 0,
+      )
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+    let anySettled = false;
     for (const payment of dueUnpaid) {
-      setPaymentPaid(payment.id, true);
+      if (await setPaymentPaid(payment.id, true)) anySettled = true;
     }
-    toast.success(t("installmentSettled"));
+    if (anySettled) toast.success(t("installmentSettled"));
   }
 
   return (

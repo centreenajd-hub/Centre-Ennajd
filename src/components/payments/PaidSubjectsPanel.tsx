@@ -73,10 +73,11 @@ export function PaidSubjectsPanel({ rows, studentsById }: PaidSubjectsPanelProps
 
   // Mark-unpaid: re-open the LATEST settled installment (same convention as
   // SmallGroupsPanel's undo path). The row instantly migrates to Impayés.
-  function handleMarkUnpaid(row: SubjectSettledRow) {
+  async function handleMarkUnpaid(row: SubjectSettledRow) {
     if (!row.latestSettledPaymentId) return;
-    setPaymentPaid(row.latestSettledPaymentId, false);
-    toast.success(t("installmentUnpaid"));
+    if (await setPaymentPaid(row.latestSettledPaymentId, false)) {
+      toast.success(t("installmentUnpaid"));
+    }
   }
 
   return (

@@ -81,11 +81,12 @@ export function SettleStudentDialog({ student, disabled, trigger }: SettleStuden
     return map;
   }, [student.enrollments]);
 
-  function handleSettleAll() {
+  async function handleSettleAll() {
+    let anySettled = false;
     for (const payment of settlement.remaining) {
-      setPaymentPaid(payment.id, true);
+      if (await setPaymentPaid(payment.id, true)) anySettled = true;
     }
-    toast.success(t("settledToast"));
+    if (anySettled) toast.success(t("settledToast"));
   }
 
   return (

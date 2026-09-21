@@ -130,16 +130,20 @@ export default function AttendancePanel({ session, date, now }: AttendancePanelP
 
   // Settle the WHOLE subject debt in one tap — aligned with the Payments
   // page row-settle and the OverdueStudentsCard button (previously this only
-  // cleared the single earliest installment).
+  // cleared the single earliest installment). Sorted dueDate-ascending so
+  // the chronological settlement dependency (Month 1 before Month 2, etc.)
+  // is satisfied one installment at a time.
   function settleOutstanding(studentId: string) {
-    const dueUnpaid = payments.filter(
-      (p) =>
-        p.studentId === studentId &&
-        p.subject === session.subject &&
-        !p.isPaid &&
-        p.dueDate <= todayKey &&
-        getPaymentRemaining(p) > 0,
-    );
+    const dueUnpaid = payments
+      .filter(
+        (p) =>
+          p.studentId === studentId &&
+          p.subject === session.subject &&
+          !p.isPaid &&
+          p.dueDate <= todayKey &&
+          getPaymentRemaining(p) > 0,
+      )
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
     for (const payment of dueUnpaid) {
       setPaymentPaid(payment.id, true);
     }

@@ -47,8 +47,9 @@ export function PaymentsToReceiveCard() {
 
   // Settles exactly this month's clean complement in one tap.
   async function handleSettle(paymentId: string) {
-    await setPaymentPaid(paymentId, true);
-    toast.success(t("installmentSettled"));
+    if (await setPaymentPaid(paymentId, true)) {
+      toast.success(t("installmentSettled"));
+    }
   }
 
   if (rows.length === 0) return null;

@@ -28,6 +28,7 @@ import {
   generateScheduleFor,
   getPaymentRuleFor,
   isMoreSettledPayment,
+  isPaymentFullyPaid,
   isSettlementRecorded,
   recalculateStudentSubjectLedger,
   reconcileRuleALedger,
@@ -54,7 +55,6 @@ import {
   fetchAllSessions,
   fetchAllStudents,
   markAttendanceDoc,
-  setPaymentPaidDoc,
   setPriceDoc,
   updatePaymentsBatchDoc,
   updateSessionDoc,
@@ -238,7 +238,9 @@ interface EnnajdState {
     studentId: string,
     subject: Subject,
   ) => Promise<void>;
-  setPaymentPaid: (paymentId: string, isPaid: boolean) => Promise<void>;
+  /** Returns `false` when the chronological guard blocked the change or the
+   *  write failed (already reverted + toasted); `true` when it landed. */
+  setPaymentPaid: (paymentId: string, isPaid: boolean) => Promise<boolean>;
   recordPartialPayment: (
     studentId: string,
     subject: Subject,
@@ -1266,20 +1268,103 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
     }
   },
 
+  /**
+   * CHRONOLOGICAL SETTLEMENT DEPENDENCY (Rule A only — the session-based
+   * proration engine's Month 1 → Month 2 → Month 3+ sequence). Rule B's
+   * rolling months are independent charges with no such dependency.
+   *
+   *  - Settling a month is BLOCKED while an earlier not-fully-paid month
+   *    of the same student+subject exists — Month 2 can never turn green
+   *    while Month 1 is still red.
+   *  - Un-settling a month CASCADES forward: every later month that was
+   *    fully paid instantly reverts to unpaid too, so a green Month 2
+   *    never survives its Month 1 flipping back to red.
+   *  - Reverting to unpaid ALSO resets `amountPaid` to 0, fully lifting
+   *    the settlement lock (`isSettlementRecorded`) so the reactive
+   *    ledger is free to recompute that month's `amountDue` dynamically
+   *    instead of treating it as an immutable settled record.
+   */
   setPaymentPaid: async (paymentId, isPaid) => {
+    const state = get();
+    const payment = state.payments.find((p) => p.id === paymentId);
+    if (!payment) return false;
+
+    if (isPaid && payment.rule === "A") {
+      const earlierUnpaid = state.payments.some(
+        (p) =>
+          p.studentId === payment.studentId &&
+          p.subject === payment.subject &&
+          p.rule === "A" &&
+          p.dueDate < payment.dueDate &&
+          !isPaymentFullyPaid(p),
+      );
+      if (earlierUnpaid) {
+        toast.error(t("chronologicalSettlementBlocked"));
+        return false;
+      }
+    }
+
     const updatedAt = new Date().toISOString();
-    const previous = get().payments;
-    set((state) => ({
-      payments: state.payments.map((p) =>
-        p.id === paymentId ? { ...p, isPaid, updatedAt } : p,
-      ),
+    const previous = state.payments;
+
+    const idsToRevert = new Set<string>([paymentId]);
+    if (!isPaid && payment.rule === "A") {
+      for (const p of state.payments) {
+        if (
+          p.studentId === payment.studentId &&
+          p.subject === payment.subject &&
+          p.rule === "A" &&
+          p.dueDate > payment.dueDate &&
+          isPaymentFullyPaid(p)
+        ) {
+          idsToRevert.add(p.id);
+        }
+      }
+    }
+
+    const patches: Array<Pick<Payment, "id"> & Partial<Payment>> = [
+      ...idsToRevert,
+    ].map((id) => ({
+      id,
+      isPaid,
+      amountPaid: isPaid ? undefined : 0,
+      updatedAt,
     }));
+    const patchById = new Map(patches.map((p) => [p.id, p]));
+
+    set((s) => ({
+      payments: s.payments.map((p) => {
+        const patch = patchById.get(p.id);
+        return patch
+          ? {
+              ...p,
+              isPaid: patch.isPaid!,
+              amountPaid: patch.amountPaid ?? p.amountPaid,
+              updatedAt,
+            }
+          : p;
+      }),
+    }));
+
     try {
-      await setPaymentPaidDoc(paymentId, isPaid, updatedAt);
+      await updatePaymentsBatchDoc(patches);
     } catch (err) {
       set({ payments: previous });
       toast.error(t("paymentSaveFailed"));
+      return false;
     }
+
+    // The lock is now fully lifted on every reverted row — re-derive the
+    // subject's ledger immediately instead of waiting for the next
+    // attendance mark, so amountDue recalculates dynamically right away.
+    if (!isPaid) {
+      void get()
+        .recalculatePaymentsForStudentSubject(payment.studentId, payment.subject)
+        .catch((err) => {
+          console.error("[ennajd] reactive ledger recalc failed:", err);
+        });
+    }
+    return true;
   },
 
   recordPartialPayment: async (studentId, subject, amount, asOf) => {

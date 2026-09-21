@@ -70,16 +70,17 @@ export function PaymentCellPopover({
   const unpaidCount = monthPayments.filter((p) => !isSettled(p)).length;
   const paidCount = monthPayments.length - unpaidCount;
 
-  function handleSettleMonth() {
+  async function handleSettleMonth() {
+    let anySettled = false;
     for (const payment of monthPayments.filter((p) => !isSettled(p))) {
-      setPaymentPaid(payment.id, true);
+      if (await setPaymentPaid(payment.id, true)) anySettled = true;
     }
-    toast.success(t("installmentSettled"));
+    if (anySettled) toast.success(t("installmentSettled"));
   }
 
-  function handleUnsettleMonth() {
+  async function handleUnsettleMonth() {
     for (const payment of monthPayments.filter((p) => isSettled(p))) {
-      setPaymentPaid(payment.id, false);
+      await setPaymentPaid(payment.id, false);
     }
     toast.success(t("installmentUnpaid"));
   }
@@ -142,9 +143,10 @@ export function PaymentCellPopover({
                       className="h-8 w-8 rounded-lg text-muted-foreground hover:text-foreground"
                       title={t("markUnpaid")}
                       aria-label={t("markUnpaid")}
-                      onClick={() => {
-                        setPaymentPaid(payment.id, false);
-                        toast.success(t("installmentUnpaid"));
+                      onClick={async () => {
+                        if (await setPaymentPaid(payment.id, false)) {
+                          toast.success(t("installmentUnpaid"));
+                        }
                       }}
                     >
                       <RotateCcw className="h-4 w-4" />
@@ -157,9 +159,10 @@ export function PaymentCellPopover({
                       className="h-8 w-8 rounded-lg text-success hover:bg-success/10 hover:text-success"
                       title={t("markPaid")}
                       aria-label={t("markPaid")}
-                      onClick={() => {
-                        setPaymentPaid(payment.id, true);
-                        toast.success(t("installmentSettled"));
+                      onClick={async () => {
+                        if (await setPaymentPaid(payment.id, true)) {
+                          toast.success(t("installmentSettled"));
+                        }
                       }}
                     >
                       <Check className="h-4 w-4" />

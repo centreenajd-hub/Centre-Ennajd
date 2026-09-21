@@ -403,6 +403,8 @@ const dictionary = {
     ledgerRecalculated: "Compte recalculé pour {student}",
     ledgerRecalcFailed:
       "Le recalcul du compte a échoué — la présence est bien enregistrée. Il sera mis à jour à la prochaine synchronisation.",
+    chronologicalSettlementBlocked:
+      "Impossible de régler ce mois — le mois précédent est encore impayé.",
     studentSaveFailed: "Échec de l'enregistrement de l'élève",
     studentDeleteFailed: "Échec de la suppression de l'élève",
     sessionDeleteFailed: "Échec de la suppression de la séance",
@@ -809,6 +811,8 @@ const dictionary = {
     ledgerRecalculated: "تمت إعادة حساب كشف الرسوم لـ {student}",
     ledgerRecalcFailed:
       "فشلت إعادة حساب كشف الرسوم — تم حفظ الحضور بنجاح وسيتم تحديثه عند المزامنة القادمة.",
+    chronologicalSettlementBlocked:
+      "لا يمكن تسوية هذا الشهر — الشهر السابق ما زال غير مدفوع.",
     studentSaveFailed: "فشل حفظ الطالب",
     studentDeleteFailed: "فشل حذف الطالب",
     sessionDeleteFailed: "فشل حذف الحصة",

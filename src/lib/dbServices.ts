@@ -363,19 +363,6 @@ export async function upsertPaymentsBatchDoc(payments: Payment[]): Promise<void>
   }
 }
 
-export function setPaymentPaidDoc(
-  id: string,
-  isPaid: boolean,
-  updatedAt: string,
-): Promise<void> {
-  return wrapSupabaseVoid(
-    supabase
-      .from("payments")
-      .update({ is_paid: isPaid, updated_at: updatedAt } as never)
-      .eq("id", id),
-  );
-}
-
 /**
  * Batch patch for amountPaid/isPaid — used by recordPartialPayment which
  * may spill over into the next installment in a single atomic commit.

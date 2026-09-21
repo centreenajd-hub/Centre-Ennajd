@@ -108,11 +108,12 @@ export function PaymentRuleTable({
   // Settles the ENTIRE visible subject debt: every due+unpaid installment of
   // the row goes isPaid → the row vanishes instantly (synchronous Zustand
   // update) and only reappears when the next cycle's dueDate passes today.
-  function handleSettleRow(row: SubjectOverdueRow) {
+  async function handleSettleRow(row: SubjectOverdueRow) {
+    let anySettled = false;
     for (const payment of row.installments) {
-      setPaymentPaid(payment.id, true);
+      if (await setPaymentPaid(payment.id, true)) anySettled = true;
     }
-    toast.success(t("installmentSettled"));
+    if (anySettled) toast.success(t("installmentSettled"));
   }
 
   const sorted = useMemo(() => {
