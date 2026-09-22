@@ -15,6 +15,7 @@ import { formatDateKey } from "@/lib/ennajd-billing";
 import { buildPaymentMatrix, type PaymentMatrixRow } from "@/lib/ennajd-payment-report";
 import type { SessionScope } from "@/lib/ennajd-report-scope";
 import {
+  ATTENDANCE_ROWS_PER_PAGE,
   REPORT_ROWS_PER_PAGE,
   chunkRows,
   getAcademicYearMonths,
@@ -125,6 +126,8 @@ const reportStyles = StyleSheet.create({
     flexDirection: "row",
     borderBottomWidth: 0.5,
     borderColor: BW_PALETTE.black,
+    // Print hygiene: never split a student row across a page bottom.
+    breakInside: "avoid",
   },
 
   tableHeaderRow: {
@@ -334,6 +337,16 @@ const reportStyles = StyleSheet.create({
     fontSize: 8,
     fontWeight: 700,
     textAlign: "center",
+  },
+
+  // Page number footer pinned to the bottom of every attendance page
+  attendanceFooter: {
+    position: "absolute",
+    bottom: 10,
+    left: 20,
+    right: 20,
+    flexDirection: "row",
+    justifyContent: "center",
   },
 
   // Page number footer for payments report
@@ -776,6 +789,8 @@ function AttendancePage({
   track,
   groupType,
   appName,
+  pageNumber,
+  totalPages,
 }: {
   chunk: AttendanceMatrixRow[];
   dates: string[];
@@ -787,6 +802,8 @@ function AttendancePage({
   track: Track | null;
   groupType: GroupType | null;
   appName: string;
+  pageNumber: number;
+  totalPages: number;
 }) {
   const [year, month] = monthKey.split("-").map(Number);
   const monthName = new Date(year, month - 1, 1).toLocaleDateString("fr-FR", {
@@ -901,6 +918,13 @@ function AttendancePage({
             </View>
           );
         })}
+      </View>
+
+      {/* Page number footer */}
+      <View style={reportStyles.attendanceFooter}>
+        <Text style={reportStyles.pageNumberText}>
+          Page {pageNumber}/{totalPages}
+        </Text>
       </View>
     </Page>
   );
@@ -1149,7 +1173,7 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
       month: "long",
       year: "numeric",
     });
-    const chunks = chunkRows(matrix.rows, REPORT_ROWS_PER_PAGE);
+    const chunks = chunkRows(matrix.rows, ATTENDANCE_ROWS_PER_PAGE);
     const pageChunks: typeof chunks = chunks.length > 0 ? chunks : [[]];
     pageChunks.forEach((chunk, idx) => {
       pages.push(
@@ -1165,6 +1189,8 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
           track={options.track}
           groupType={options.groupType}
           appName={options.appName}
+          pageNumber={idx + 1}
+          totalPages={pageChunks.length}
         />,
       );
     });
