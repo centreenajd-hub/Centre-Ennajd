@@ -184,8 +184,9 @@ const reportStyles = StyleSheet.create({
     flexDirection: "row",
     borderBottomWidth: 0.75,
     borderColor: BW_PALETTE.black,
-    // Strict row height keeps blank ruled rows from collapsing to zero.
-    height: 20,
+    // A hardcoded `height` + vertical padding makes Yoga treat the row's text
+    // as an overflow and silently drop it — minHeight alone keeps blank ruled
+    // rows from collapsing without clipping student names.
     minHeight: 20,
     // Print hygiene: never split a student row across a page bottom.
     breakInside: "avoid",
@@ -202,7 +203,7 @@ const reportStyles = StyleSheet.create({
 
   attIndexCell: {
     width: ATT_INDEX_WIDTH,
-    paddingVertical: 5,
+    paddingVertical: 3,
     borderRightWidth: 0.75,
     borderColor: BW_PALETTE.black,
     alignItems: "center",
@@ -236,8 +237,8 @@ const reportStyles = StyleSheet.create({
 
   attNameCell: {
     width: ATT_NAME_WIDTH,
-    paddingVertical: 5,
-    paddingHorizontal: 6,
+    paddingVertical: 3,
+    paddingHorizontal: 4,
     borderRightWidth: 0.75,
     borderColor: BW_PALETTE.black,
     justifyContent: "center",
@@ -245,15 +246,15 @@ const reportStyles = StyleSheet.create({
 
   attSessionCell: {
     width: ATT_SESSION_WIDTH,
-    paddingVertical: 5,
+    paddingVertical: 3,
     borderRightWidth: 0.75,
     borderColor: BW_PALETTE.black,
   },
 
   attPaymentCell: {
     width: ATT_PAYMENT_WIDTH,
-    paddingVertical: 5,
-    paddingHorizontal: 6,
+    paddingVertical: 3,
+    paddingHorizontal: 4,
     alignItems: "center",
     justifyContent: "center",
   },
