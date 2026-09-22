@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 
 import { Document, Font, Image, Page, StyleSheet, Text, View, pdf } from "@react-pdf/renderer";
 
-import logoCentreEnnajd from "@/assets/logo-centre-ennajd.jpeg";
+import logo from "@/assets/logo.png";
 
 import {
   buildAttendanceMatrix,
@@ -362,15 +362,10 @@ const reportStyles = StyleSheet.create({
     marginBottom: 6,
   },
 
-  attendanceLogo: {
-    width: 40,
-    height: 40,
-    marginRight: 8,
-  },
-
   attendanceBrand: {
     fontSize: 13,
     fontWeight: 700,
+    marginLeft: 8,
   },
 
   // Page number footer for payments report
@@ -854,7 +849,7 @@ function AttendancePage({
       {/* Header block — the `fixed` prop repeats it at the top of every page */}
       <View fixed style={reportStyles.attendanceHeader}>
         <View style={reportStyles.attendanceHeaderTop}>
-          <Image style={reportStyles.attendanceLogo} src={logoCentreEnnajd} />
+          <Image src={logo} style={{ width: 55, height: 55, objectFit: "contain" }} />
           <Text style={reportStyles.attendanceBrand}>CENTRE ENNAJD</Text>
         </View>
 
@@ -951,9 +946,9 @@ function AttendancePage({
       {/* Page number footer — repeats at the bottom of every page */}
       <View style={reportStyles.attendanceFooter}>
         <Text
-          style={reportStyles.pageNumberText}
           render={({ pageNumber, totalPages }) => `Page ${pageNumber} /${totalPages}`}
           fixed
+          style={{ fontSize: 9, textAlign: "center", marginTop: 8 }}
         />
       </View>
     </Page>
