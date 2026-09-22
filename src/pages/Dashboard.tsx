@@ -8,6 +8,7 @@ import { UpcomingSessionNotice } from "@/components/dashboard/UpcomingSessionNot
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
 import { useNowTick } from "@/hooks/use-now-tick";
 import { getMinutesUntilNextOccurrence, isSessionVisibleUnified } from "@/lib/ennajd-taxonomy";
+import { dismissalKey, useDismissedSessions } from "@/lib/session-dismissal";
 import { useI18n } from "@/lib/i18n";
 import { runWhenIdle } from "@/lib/run-when-idle";
 import type { Session } from "@/types/ennajd";
@@ -26,9 +27,19 @@ export default function Dashboard() {
 
   const date = now.toISOString().slice(0, 10);
 
+  // Sessions the admin dismissed from the live list (per occurrence). These
+  // stay dismissed until the day rolls over — the app never removes a live
+  // session on its own.
+  const dismissed = useDismissedSessions();
+
   const liveSessions = useMemo(
-    () => sessions.filter((session) => isSessionVisibleUnified(session, now)),
-    [sessions, now],
+    () =>
+      sessions.filter(
+        (session) =>
+          isSessionVisibleUnified(session, now) &&
+          !dismissed.has(dismissalKey(session.id, date)),
+      ),
+    [sessions, now, date, dismissed],
   );
 
   const nextSession = useMemo(() => {
@@ -114,7 +125,6 @@ export default function Dashboard() {
                 key={session.id}
                 session={session}
                 now={now}
-                date={date}
                 onOpenAttendance={() => setModalSession(session)}
               />
             ))}

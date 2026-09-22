@@ -1,19 +1,35 @@
-import { ChevronDown, Clock, Users } from "lucide-react";
+import { ChevronDown, Clock, MoreVertical, Trash2, Users } from "lucide-react";
 import { useMemo } from "react";
 
 import { ExportAttendanceButton } from "@/components/dashboard/ExportAttendanceButton";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import { getEnrolledStudentsForSession, isOneOffSession, isSessionVisibleUnified } from "@/lib/ennajd-taxonomy";
+import {
+  dismissSession,
+  undismissSession,
+} from "@/lib/session-dismissal";
+import {
+  formatDateKeyLocal,
+  getEnrolledStudentsForSession,
+  isOneOffSession,
+  isSessionInProgress,
+} from "@/lib/ennajd-taxonomy";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 import type { Session } from "@/types/ennajd";
 
 interface LiveSessionCardProps {
   session: Session;
   now: Date;
-  date: string;
   onOpenAttendance: () => void;
 }
 
@@ -25,7 +41,6 @@ function timeToMinutes(time: string): number {
 export function LiveSessionCard({
   session,
   now,
-  date,
   onOpenAttendance,
 }: LiveSessionCardProps) {
   const { t } = useI18n();
@@ -49,12 +64,25 @@ export function LiveSessionCard({
     statusLabel = t("inProgress");
     statusClass = "bg-success/15 text-success";
   } else {
-    statusLabel = t("endingSoon");
-    statusClass = "bg-accent/20 text-accent-foreground";
+    statusLabel = t("ended");
+    statusClass = "bg-muted text-muted-foreground";
   }
 
   const isExtra = isOneOffSession(session);
-  const isActiveWindow = isSessionVisibleUnified(session, now);
+  const isActiveWindow = isSessionInProgress(session, now);
+
+  // A dismissal is scoped to this specific occurrence so the session comes
+  // back by itself next time it's scheduled.
+  const occurrenceDate = formatDateKeyLocal(now);
+  const handleDismiss = () => {
+    dismissSession(session.id, occurrenceDate);
+    toast(t("removedFromLive"), {
+      action: {
+        label: t("undo"),
+        onClick: () => undismissSession(session.id, occurrenceDate),
+      },
+    });
+  };
 
   return (
     <Card className="overflow-hidden rounded-2xl border-border shadow-sm transition-shadow hover:shadow-md">
@@ -108,6 +136,29 @@ export function LiveSessionCard({
               {statusLabel}
             </span>
             <ExportAttendanceButton session={session} />
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  data-testid="live-session-menu"
+                  className="h-8 w-8 shrink-0 rounded-lg"
+                  aria-label={t("sessionOptions")}
+                >
+                  <MoreVertical className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  data-testid="dismiss-live-session"
+                  onClick={handleDismiss}
+                  className="gap-2 text-destructive focus:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {t("removeFromLive")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
           <button
             type="button"

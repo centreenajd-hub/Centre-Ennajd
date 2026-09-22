@@ -317,9 +317,6 @@ export const SESSION_KIND_LABELS: Record<SessionKind, { fr: string; ar: string }
 /** A session becomes visible this many minutes before its startTime. */
 const VISIBILITY_BEFORE_MIN = 40;
 
-/** A session stays visible this many minutes after its startTime. */
-const VISIBILITY_AFTER_MIN = 70;
-
 /** Auto-absence fires this many minutes after startTime. */
 const AUTO_ABSENCE_AFTER_MIN = 32;
 
@@ -333,20 +330,20 @@ function minutesSinceMidnight(date: Date): number {
 }
 
 /**
- * Session Visibility Engine: a session is visible from startTime-40min
- * until startTime+70min, on its own day of week, per the real device clock.
+ * Session Visibility Engine: a session appears on the dashboard
+ * VISIBILITY_BEFORE_MIN before its startTime on its own day of week, and
+ * STAYS visible for the rest of that day — the app never hides a live
+ * session on its own. The only automatic removal is the day rollover; the
+ * admin dismisses finished sessions manually via the card's ⋮ menu.
  */
 export function isSessionVisible(session: Session, now: Date): boolean {
   if (now.getDay() !== session.dayOfWeek) return false;
   const startMinutes = parseTimeToMinutes(session.startTime);
   const nowMinutes = minutesSinceMidnight(now);
-  return (
-    nowMinutes >= startMinutes - VISIBILITY_BEFORE_MIN &&
-    nowMinutes <= startMinutes + VISIBILITY_AFTER_MIN
-  );
+  return nowMinutes >= startMinutes - VISIBILITY_BEFORE_MIN;
 }
 
-/** One-off visibility: visible only on its exact date inside the time window. */
+/** One-off visibility: visible only on its exact date, from its start onward. */
 export function isOneOffSessionVisible(session: Session, now: Date): boolean {
   if (!isOneOffSession(session)) return false;
   if (!session.date) return false;
@@ -354,15 +351,32 @@ export function isOneOffSessionVisible(session: Session, now: Date): boolean {
   if (session.date !== todayKey) return false;
   const startMinutes = parseTimeToMinutes(session.startTime);
   const nowMinutes = minutesSinceMidnight(now);
-  return (
-    nowMinutes >= startMinutes - VISIBILITY_BEFORE_MIN &&
-    nowMinutes <= startMinutes + VISIBILITY_AFTER_MIN
-  );
+  return nowMinutes >= startMinutes - VISIBILITY_BEFORE_MIN;
 }
 
 /** Unified dispatcher — handles both Fix and Zaida. */
 export function isSessionVisibleUnified(session: Session, now: Date): boolean {
   return isOneOffSession(session) ? isOneOffSessionVisible(session, now) : isSessionVisible(session, now);
+}
+
+/**
+ * "Active now" — the session has gone live (its visibility window has
+ * opened) and it has not passed its endTime yet. Drives the green badge;
+ * the card itself outlives this (see isSessionVisibleUnified).
+ */
+export function isSessionInProgress(session: Session, now: Date): boolean {
+  if (isOneOffSession(session)) {
+    if (!session.date) return false;
+    if (session.date !== formatDateKeyLocal(now)) return false;
+  } else if (now.getDay() !== session.dayOfWeek) {
+    return false;
+  }
+  const startMinutes = parseTimeToMinutes(session.startTime);
+  const endMinutes = parseTimeToMinutes(session.endTime);
+  const nowMinutes = minutesSinceMidnight(now);
+  return (
+    nowMinutes >= startMinutes - VISIBILITY_BEFORE_MIN && nowMinutes <= endMinutes
+  );
 }
 
 /**
