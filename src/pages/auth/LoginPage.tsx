@@ -1,17 +1,10 @@
-import { type FormEvent, useEffect, useState } from "react";
-import { Fingerprint, Loader2, Lock, LogIn, Mail } from "lucide-react";
+import { type FormEvent, useState } from "react";
+import { Loader2, Lock, LogIn, Mail } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  signIn,
-  isWebAuthnSupported,
-  hasRegisteredCredentials,
-  authenticateWithWebAuthn,
-  getRegisterOptions,
-  registerCredential,
-} from "@/lib/auth-client";
+import { signIn } from "@/lib/auth-client";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -48,21 +41,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isBiometricAvailable, setIsBiometricAvailable] = useState(false);
-  const [hasBiometric, setHasBiometric] = useState(false);
-  const [biometricLoading, setBiometricLoading] = useState(false);
-  const [enableBiometric, setEnableBiometric] = useState(false);
-  const [registerLoading, setRegisterLoading] = useState(false);
   const isAr = lang === "ar";
-
-  // Check WebAuthn availability and if user has registered
-  useEffect(() => {
-    if (isWebAuthnSupported()) {
-      setIsBiometricAvailable(true);
-      // Check if email user has registered credentials
-      hasRegisteredCredentials(email).then(setHasBiometric).catch(() => setHasBiometric(false));
-    }
-  }, [email]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -70,47 +49,11 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await signIn(email, password);
-      // After successful login, optionally register biometric
-      if (enableBiometric && isBiometricAvailable && !hasBiometric) {
-        await registerBiometric();
-      }
     } catch (err) {
       const code = err instanceof Error && "code" in err ? String((err as { code: string }).code) : "";
       setError(getErrorMessage(code, lang));
     } finally {
       setLoading(false);
-    }
-  };
-
-  const registerBiometric = async () => {
-    setRegisterLoading(true);
-    setError(null);
-    try {
-      const options = await getRegisterOptions(email);
-      await registerCredential(options, email);
-      setHasBiometric(true);
-      setEnableBiometric(false);
-    } catch (err) {
-      setError(
-        isAr
-          ? "فشل تسجيل البصمة. حاول مرة أخرى."
-          : "Échec de l'enregistrement biométrique. Réessayez."
-      );
-    } finally {
-      setRegisterLoading(false);
-    }
-  };
-
-  const handleBiometricLogin = async () => {
-    setBiometricLoading(true);
-    setError(null);
-    try {
-      await authenticateWithWebAuthn(email);
-    } catch (err) {
-      const code = err instanceof Error && "code" in err ? String((err as { code: string }).code) : "";
-      setError(getErrorMessage(code, lang));
-    } finally {
-      setBiometricLoading(false);
     }
   };
 
@@ -177,53 +120,12 @@ export default function LoginPage() {
               </p>
             )}
 
-            {/* Biometric login button - shown when user has registered and email is entered */}
-            {isBiometricAvailable && hasBiometric && email && (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={biometricLoading || !email}
-                className="gap-2 rounded-xl border-primary/30"
-                onClick={handleBiometricLogin}
-              >
-                {biometricLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Fingerprint className="h-4 w-4 text-primary" />
-                )}
-                {isAr ? "تسجيل الدخول بالبصمة" : "Connexion biométrique"}
-              </Button>
-            )}
-
-            {/* Enable biometric checkbox - shown after first successful login */}
-            {isBiometricAvailable && loading !== true && (
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={enableBiometric}
-                  onChange={(e) => setEnableBiometric(e.target.checked)}
-                  className="h-4 w-4 rounded border-border text-primary focus:ring-primary"
-                  disabled={hasBiometric}
-                />
-                <span className="text-muted-foreground">
-                  {isAr
-                    ? "تسجيل الدخول بالبصمة بعد تسجيل الدخول (Touch ID / Face ID)"
-                    : "Activer la connexion biométrique (Touch ID / Face ID)"}
-                </span>
-                {hasBiometric && (
-                  <span className="text-xs text-green-600">
-                    {isAr ? "مُفعّل" : "Activé"}
-                  </span>
-                )}
-              </label>
-            )}
-
             <Button
               type="submit"
-              disabled={loading || registerLoading}
+              disabled={loading}
               className="mt-1 gap-2 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90"
             >
-              {loading || registerLoading ? (
+              {loading ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
                 <LogIn className="h-4 w-4" />
@@ -232,13 +134,9 @@ export default function LoginPage() {
                 ? isAr
                   ? "جاري التسجيل..."
                   : "Connexion..."
-                : registerLoading
-                  ? isAr
-                    ? "إعداد البصمة..."
-                    : "Configuration biométrique..."
-                  : isAr
-                    ? "تسجيل الدخول"
-                    : "Se connecter"}
+                : isAr
+                  ? "تسجيل الدخول"
+                  : "Se connecter"}
             </Button>
           </form>
         </div>

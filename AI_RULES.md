@@ -14,7 +14,7 @@
 # Centre Ennajd ERP — Project Conventions
 
 - Single source of truth: `src/hooks/use-ennajd-state.ts` (Zustand, backed by Supabase — see below). All students/sessions/prices reads and writes go through this store — never re-derive state elsewhere.
-- Supabase: `src/lib/supabase.ts` (client init), `src/lib/auth-client.ts` (email/password sign-in + WebAuthn/biometric auth), `src/lib/dbServices.ts` (CRUD/subscriptions), `src/lib/ennajd-firestore-sync.ts` (`useFirestoreSync()` hydrates the store in real time via Supabase realtime channels). Authentication is currently disabled — all routes are publicly accessible.
+- Supabase: `src/lib/supabase.ts` (client init), `src/lib/auth-client.ts` (email/password sign-in), `src/lib/dbServices.ts` (CRUD/subscriptions), `src/lib/ennajd-firestore-sync.ts` (`useFirestoreSync()` hydrates the store in real time via Supabase realtime channels). Authentication is currently disabled — all routes are publicly accessible.
 - SQL Schema: `supabase/schema.sql` contains the complete table definitions with RLS policies.
 - Domain types: `src/types/ennajd.ts` for app types, `src/types/supabase.ts` for database row types.
 - Business/routing rules (Level → Track → Subject → GroupType matrix): `src/lib/ennajd-taxonomy.ts`. This is pure data/functions with zero React/Zustand imports — always read rules from here instead of re-deriving them inline (e.g. `getSubjectsFor`, `isGroupTypeApplicable`, `isTrackRequired`).
