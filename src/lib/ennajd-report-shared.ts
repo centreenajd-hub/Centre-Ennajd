@@ -8,11 +8,11 @@ import type { Student } from "@/types/ennajd";
 export const REPORT_ROWS_PER_PAGE = 31;
 
 /**
- * Attendance pages are landscape and carry up to 31 day columns plus the
- * TOT/PAIEMENT columns, so their rows are wider and fewer fit per page than
- * the payments matrix. This cap keeps rows clear of the bottom margin.
+ * Attendance pages are portrait A4 with one name column, 10 session check
+ * boxes and a payment column (~26 data rows + 6 blank addition rows on the
+ * final page), so rows stay clear of the bottom margin.
  */
-export const ATTENDANCE_ROWS_PER_PAGE = 20;
+export const ATTENDANCE_ROWS_PER_PAGE = 26;
 
 /** Sorts students by last name, then first name — shared by every report matrix. */
 export function sortStudentsAlphabetically(students: Student[]): Student[] {

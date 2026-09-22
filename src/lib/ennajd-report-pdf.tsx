@@ -6,10 +6,7 @@ import type { ReactNode } from "react";
 
 import { Document, Font, Image, Page, StyleSheet, Text, View, pdf } from "@react-pdf/renderer";
 
-import logo from "@/assets/logo.png";
-
-import {
-  buildAttendanceMatrix,
+import { buildAttendanceMatrix,
   type AttendanceMatrix,
   type AttendanceMatrixRow,
 } from "@/lib/ennajd-attendance-report";
@@ -57,6 +54,20 @@ const BW_PALETTE = {
   lightGray: "#cccccc",
 };
 
+// Portrait A4 attendance sheet — Word-template column widths.
+// Content width = 595.28pt (A4 portrait) − 2 × 26pt page margins = 543.28pt:
+// name column ~30%, 10 session check boxes ~4.5% each, payment status ~25%.
+const ATT_NAME_WIDTH = 163;
+const ATT_SESSION_WIDTH = 24.45;
+const ATT_PAYMENT_WIDTH = 135.78;
+
+/** Number of blank ruled rows added at the bottom of the final attendance
+ *  page for handwritten additions. */
+const ATTENDANCE_BLANK_ROWS = 6;
+
+/** Number of tickable session columns on the attendance sheet. */
+const ATTENDANCE_SESSION_COLUMNS = 10;
+
 // Styles for the classic B&W reports
 const reportStyles = StyleSheet.create({
   // Base page style for reports (always French, LTR, Helvetica)
@@ -68,11 +79,13 @@ const reportStyles = StyleSheet.create({
     color: BW_PALETTE.black,
   },
 
-  // Attendance report specific page (landscape)
+  // Attendance sheet page — portrait A4, Word-template layout. Tight 26pt
+  // margins with extra bottom clearance for the absolute page-number footer.
   attendancePage: {
     fontFamily: "Helvetica",
     fontSize: 8,
-    padding: 20,
+    padding: 26,
+    paddingBottom: 42,
     backgroundColor: BW_PALETTE.white,
     color: BW_PALETTE.black,
   },
@@ -103,22 +116,38 @@ const reportStyles = StyleSheet.create({
     fontWeight: 600,
   },
 
-  infoContainer: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 10,
-  },
-
   leftInfo: {
     flexDirection: "column",
   },
 
-  rightInfo: {
-    flexDirection: "column",
-    alignItems: "flex-end",
+  // --- Attendance sheet header (`fixed` repeats it on every page) ---
+  attendanceHeader: {
+    marginBottom: 8,
+  },
+
+  attendanceMetaRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 8,
+  },
+
+  attendanceMetaText: {
+    fontSize: 9.5,
+    fontWeight: 600,
+    marginBottom: 2,
+  },
+
+  attendanceTitle: {
+    fontSize: 15,
+    fontWeight: 700,
+    textAlign: "center",
+    textDecoration: "underline",
+    marginBottom: 12,
   },
 
   // Table styles
+  // Shared table frame (attendance sheet + payments matrix)
   table: {
     borderWidth: 0.5,
     borderColor: BW_PALETTE.black,
@@ -138,143 +167,83 @@ const reportStyles = StyleSheet.create({
     borderColor: BW_PALETTE.black,
   },
 
-  tableCell: {
-    paddingVertical: 3,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
+  // --- Attendance sheet table (solid 0.75pt black borders, no row splits) ---
+  attendanceTable: {
+    borderWidth: 0.75,
     borderColor: BW_PALETTE.black,
+  },
+
+  attendanceHeaderRow: {
+    flexDirection: "row",
+    borderBottomWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+  },
+
+  attendanceRow: {
+    flexDirection: "row",
+    borderBottomWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+    // Print hygiene: never split a student row across a page bottom.
+    breakInside: "avoid",
+  },
+
+  attNameHeaderCell: {
+    width: ATT_NAME_WIDTH,
+    paddingVertical: 5,
+    paddingHorizontal: 6,
+    borderRightWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+    justifyContent: "center",
+  },
+
+  // Blank-headed check box the teacher ticks once per session.
+  attSessionHeaderCell: {
+    width: ATT_SESSION_WIDTH,
+    paddingVertical: 5,
+    borderRightWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+  },
+
+  attPaymentHeaderCell: {
+    width: ATT_PAYMENT_WIDTH,
+    paddingVertical: 5,
+    paddingHorizontal: 6,
     alignItems: "center",
     justifyContent: "center",
   },
 
-  nameCell: {
-    width: 110,
-    paddingVertical: 3,
-    paddingHorizontal: 4,
-    borderRightWidth: 0.5,
+  attNameCell: {
+    width: ATT_NAME_WIDTH,
+    paddingVertical: 5,
+    paddingHorizontal: 6,
+    borderRightWidth: 0.75,
     borderColor: BW_PALETTE.black,
     justifyContent: "center",
   },
 
-  dayCell: {
-    width: 18,
-    paddingVertical: 3,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
+  attSessionCell: {
+    width: ATT_SESSION_WIDTH,
+    paddingVertical: 5,
+    borderRightWidth: 0.75,
     borderColor: BW_PALETTE.black,
+  },
+
+  attPaymentCell: {
+    width: ATT_PAYMENT_WIDTH,
+    paddingVertical: 5,
+    paddingHorizontal: 6,
     alignItems: "center",
     justifyContent: "center",
   },
 
-  totCell: {
-    width: 25,
-    paddingVertical: 3,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  paymentCell: {
-    width: 30,
-    paddingVertical: 3,
-    paddingHorizontal: 2,
-    borderRightWidth: 0,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  // Header cells
-  headerCell: {
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: BW_PALETTE.white,
-  },
-
-  nameHeaderCell: {
-    width: 110,
-    paddingVertical: 4,
-    paddingHorizontal: 4,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    justifyContent: "center",
-    backgroundColor: BW_PALETTE.white,
-  },
-
-  dayHeaderCell: {
-    width: 18,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: BW_PALETTE.white,
-  },
-
-  totHeaderCell: {
-    width: 25,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: BW_PALETTE.white,
-  },
-
-  paymentHeaderCell: {
-    width: 30,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: BW_PALETTE.white,
-  },
-
-  // Text styles
-  headerText: {
-    fontSize: 7.5,
+  attNameHeaderText: {
+    fontSize: 8.5,
     fontWeight: 700,
-    textAlign: "center",
   },
 
-  nameHeaderText: {
-    fontSize: 8,
-    fontWeight: 700,
-    textAlign: "center",
-  },
-
-  bodyText: {
-    fontSize: 8,
-    textAlign: "center",
-  },
-
-  nameText: {
-    fontSize: 8,
+  attNameText: {
+    fontSize: 8.5,
     fontWeight: 600,
-  },
-
-  markPresent: {
-    fontSize: 8,
-    fontWeight: 700,
-  },
-
-  markAbsent: {
-    fontSize: 8,
-    fontWeight: 700,
-  },
-
-  markEmpty: {
-    fontSize: 8,
   },
 
   paymentMark: {
@@ -291,45 +260,6 @@ const reportStyles = StyleSheet.create({
     borderColor: BW_PALETTE.black,
   },
 
-  totalNameCell: {
-    width: 110,
-    paddingVertical: 4,
-    paddingHorizontal: 4,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    justifyContent: "center",
-  },
-
-  totalCell: {
-    width: 18,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  totalTotCell: {
-    width: 25,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0.5,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
-  totalPaymentCell: {
-    width: 30,
-    paddingVertical: 4,
-    paddingHorizontal: 2,
-    borderRightWidth: 0,
-    borderColor: BW_PALETTE.black,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-
   totalText: {
     fontSize: 8.5,
     fontWeight: 700,
@@ -339,33 +269,6 @@ const reportStyles = StyleSheet.create({
     fontSize: 8,
     fontWeight: 700,
     textAlign: "center",
-  },
-
-  // Page number footer pinned to the bottom of every attendance page
-  attendanceFooter: {
-    position: "absolute",
-    bottom: 10,
-    left: 20,
-    right: 20,
-    flexDirection: "row",
-    justifyContent: "center",
-  },
-
-  // Center branding header (logo + name) of the attendance sheet
-  attendanceHeader: {
-    marginBottom: 10,
-  },
-
-  attendanceHeaderTop: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 6,
-  },
-
-  attendanceBrand: {
-    fontSize: 13,
-    fontWeight: 700,
-    marginLeft: 8,
   },
 
   // Page number footer for payments report
@@ -797,160 +700,124 @@ function ReportFooter({ rtl, t }: { rtl: boolean; t: (key: DictKey) => string })
   );
 }
 
+/**
+ * Builds the printed "payement" status of one student for the attendance
+ * sheet: the list of settled installments of this subject in the academic
+ * year containing `monthKey`, e.g. "½ M 9 + ½ M 10" (two settled half-month
+ * installments) or "M 10" (one settled full month).
+ */
+function buildPaymentStatusString(
+  payments: Payment[],
+  studentId: string,
+  subject: Subject,
+  monthKey: string,
+): string {
+  const academicMonths = new Set(getAcademicYearMonths(monthKey).map((m) => m.key));
+  return payments
+    .filter(
+      (p) =>
+        p.studentId === studentId && p.subject === subject && p.isPaid && academicMonths.has(p.month),
+    )
+    .map((p) => ({
+      month: p.month,
+      label: `${p.isHalfMonth ? "½ " : ""}M ${Number(p.month.split("-")[1])}`,
+    }))
+    .sort((a, b) => a.month.localeCompare(b.month))
+    .map((p) => p.label)
+    .join(" + ");
+}
+
 function AttendancePage({
   chunk,
-  dates,
   monthKey,
   sessions,
   payments,
   subject,
   level,
-  track,
-  groupType,
-  appName,
+  isLastChunk,
 }: {
   chunk: AttendanceMatrixRow[];
-  dates: string[];
   monthKey: string;
   sessions: Session[];
   payments: Payment[];
   subject: Subject;
   level: Level;
-  track: Track | null;
-  groupType: GroupType | null;
-  appName: string;
+  isLastChunk: boolean;
 }) {
-  const [year, month] = monthKey.split("-").map(Number);
-  const monthName = new Date(year, month - 1, 1).toLocaleDateString("fr-FR", {
-    month: "long",
-  }).toUpperCase();
-
-  // Get teacher name from sessions
   const teacherName = sessions.length > 0 ? sessions[0].teacherName : undefined;
 
-  // Calculate TOT for each student
-  const getStudentTot = (row: AttendanceMatrixRow): number => {
-    let count = 0;
-    for (const cell of row.cellsByDate.values()) {
-      if (cell.status === "present") count++;
-    }
-    return count;
-  };
+  // Blank ruled rows at the bottom of the final page for handwritten additions.
+  const blankRowCount = isLastChunk ? ATTENDANCE_BLANK_ROWS : 0;
 
-  // Check if student paid for this month
-  const isStudentPaidForMonth = (studentId: string): boolean => {
-    return payments.some(
-      (p) => p.studentId === studentId && p.month === monthKey && p.isPaid,
-    );
-  };
+  // The 10 session columns are intentionally empty check boxes — the sheet is
+  // printed and ticked by hand, one box per session.
+  const renderSessionCells = (): ReactNode[] =>
+    Array.from({ length: ATTENDANCE_SESSION_COLUMNS }, (_, i) => (
+      <View key={`session-${i}`} style={reportStyles.attSessionCell} />
+    ));
 
   return (
-    <Page size="A4" orientation="landscape" style={reportStyles.attendancePage}>
-      {/* Header block — the `fixed` prop repeats it at the top of every page */}
+    <Page size="A4" orientation="portrait" style={reportStyles.attendancePage}>
+      {/* Header block — `fixed` repeats it at the top of every page */}
       <View fixed style={reportStyles.attendanceHeader}>
-        <View style={reportStyles.attendanceHeaderTop}>
-          <Image src={logo} style={{ width: 55, height: 55, objectFit: "contain" }} />
-          <Text style={reportStyles.attendanceBrand}>CENTRE ENNAJD</Text>
+        <View style={reportStyles.attendanceMetaRow}>
+          <View>
+            <Text style={reportStyles.attendanceMetaText}>Matière : {subject}</Text>
+            <Text style={reportStyles.attendanceMetaText}>Niveau : {level}</Text>
+          </View>
+          <Text style={reportStyles.attendanceMetaText}>Prof : {teacherName || ""}</Text>
         </View>
 
-        {/* Main title */}
-        <Text style={reportStyles.mainTitle}>FEUILLE DE PRÉSENCE MENSUELLE</Text>
-
-        {/* Info lines */}
-        <View style={reportStyles.infoContainer}>
-        <View style={reportStyles.leftInfo}>
-          <Text style={[reportStyles.infoLine, reportStyles.infoLabel]}>
-            MATIERE : {subject}
-          </Text>
-          <Text style={[reportStyles.infoLine, reportStyles.infoLabel]}>
-            NIVEAU : {level}
-          </Text>
-          <Text style={[reportStyles.infoLine, reportStyles.infoLabel]}>
-            MOIS : {monthName}
-          </Text>
-        </View>
-        <View style={reportStyles.rightInfo}>
-          <Text style={[reportStyles.infoLine, reportStyles.infoLabel]}>
-            PROF : {teacherName || ""}
-          </Text>
-        </View>
-      </View>
+        <Text style={reportStyles.attendanceTitle}>Feuille de présence</Text>
       </View>
 
-      {/* Table */}
-      <View style={reportStyles.table}>
-        {/* Header row — `fixed` repeats it at the top of the table on every page */}
-        <View style={[reportStyles.tableHeaderRow]} fixed>
-          <View style={reportStyles.nameHeaderCell}>
-            <Text style={reportStyles.nameHeaderText}>NOM ET PRENOM</Text>
+      {/* Table: Nom-prénom | 10 blank session check boxes | payement */}
+      <View style={reportStyles.attendanceTable}>
+        <View style={reportStyles.attendanceHeaderRow} fixed>
+          <View style={reportStyles.attNameHeaderCell}>
+            <Text style={reportStyles.attNameHeaderText}>Nom-prénom</Text>
           </View>
-          {dates.map((date, index) => {
-            const day = new Date(date).getDate();
-            return (
-              <View key={date} style={reportStyles.dayHeaderCell}>
-                <Text style={reportStyles.headerText}>{day}</Text>
-              </View>
-            );
-          })}
-          <View style={reportStyles.totHeaderCell}>
-            <Text style={reportStyles.headerText}>TOT</Text>
-          </View>
-          <View style={reportStyles.paymentHeaderCell}>
-            <Text style={reportStyles.headerText}>PAIEMENT</Text>
+          {Array.from({ length: ATTENDANCE_SESSION_COLUMNS }, (_, i) => (
+            <View key={`session-header-${i}`} style={reportStyles.attSessionHeaderCell} />
+          ))}
+          <View style={reportStyles.attPaymentHeaderCell}>
+            <Text style={reportStyles.attNameHeaderText}>payement</Text>
           </View>
         </View>
 
         {/* Data rows */}
-        {chunk.map((row, rowIdx) => {
-          const tot = getStudentTot(row);
-          const isPaid = isStudentPaidForMonth(row.student.id);
-
-          return (
-            <View key={row.student.id} style={reportStyles.tableRow} wrap={false}>
-              <View style={reportStyles.nameCell}>
-                <Text style={reportStyles.nameText}>
-                  {row.student.lastName} {row.student.firstName}
-                </Text>
-              </View>
-              {dates.map((date) => {
-                const cell = row.cellsByDate.get(date);
-                if (!cell || cell.status === "not-occurred") {
-                  return (
-                    <View key={date} style={reportStyles.dayCell}>
-                      <Text style={reportStyles.markEmpty}></Text>
-                    </View>
-                  );
-                }
-                const isPresent = cell.status === "present";
-                return (
-                  <View key={date} style={reportStyles.dayCell}>
-                    <Text style={isPresent ? reportStyles.markPresent : reportStyles.markAbsent}>
-                      {isPresent ? "P" : "A"}
-                    </Text>
-                  </View>
-                );
-              })}
-              <View style={reportStyles.totCell}>
-                <Text style={reportStyles.bodyText}>{tot}</Text>
-              </View>
-              <View style={reportStyles.paymentCell}>
-                <Text style={reportStyles.paymentMark}>
-                  {isPaid ? `MOIS ${month}` : ""}
-                </Text>
-              </View>
+        {chunk.map((row) => (
+          <View key={row.student.id} style={reportStyles.attendanceRow} wrap={false}>
+            <View style={reportStyles.attNameCell}>
+              <Text style={reportStyles.attNameText}>
+                {row.student.lastName} {row.student.firstName}
+              </Text>
             </View>
-          );
-        })}
+            {renderSessionCells()}
+            <View style={reportStyles.attPaymentCell}>
+              <Text style={reportStyles.paymentMark}>
+                {buildPaymentStatusString(payments, row.student.id, subject, monthKey)}
+              </Text>
+            </View>
+          </View>
+        ))}
+
+        {/* Blank rows for manual additions on the final page */}
+        {Array.from({ length: blankRowCount }, (_, i) => (
+          <View key={`blank-${i}`} style={reportStyles.attendanceRow} wrap={false}>
+            <View style={reportStyles.attNameCell} />
+            {renderSessionCells()}
+            <View style={reportStyles.attPaymentCell} />
+          </View>
+        ))}
       </View>
 
-      {/* Page number footer — repeats at the bottom of every page */}
-      <View style={reportStyles.attendanceFooter}>
-        <Text
-          render={({ pageNumber, totalPages }) => `Page ${pageNumber} /${totalPages}`}
-          fixed
-          style={{ fontSize: 9, textAlign: "center", marginTop: 8 }}
-        />
-      </View>
+      {/* Page counter — pinned to the bottom center of every page */}
+      <Text
+        render={({ pageNumber, totalPages }) => `Page ${pageNumber} /${totalPages}`}
+        fixed
+        style={{ position: "absolute", bottom: 12, left: 0, right: 0, textAlign: "center", fontSize: 8 }}
+      />
     </Page>
   );
 }
@@ -1205,15 +1072,12 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
         <AttendancePage
           key={`attendance-${idx}`}
           chunk={chunk}
-          dates={matrix.dates}
           monthKey={monthKey}
           sessions={options.sessions}
           payments={options.payments}
           subject={options.subject}
           level={options.level}
-          track={options.track}
-          groupType={options.groupType}
-          appName={options.appName}
+          isLastChunk={idx === pageChunks.length - 1}
         />,
       );
     });
