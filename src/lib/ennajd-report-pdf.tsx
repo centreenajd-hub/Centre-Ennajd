@@ -56,10 +56,11 @@ const BW_PALETTE = {
 
 // Portrait A4 attendance sheet — Word-template column widths.
 // Content width = 595.28pt (A4 portrait) − 2 × 26pt page margins = 543.28pt:
-// name column ~30%, 10 session check boxes ~4.5% each, payment status ~25%.
-const ATT_NAME_WIDTH = 163;
-const ATT_SESSION_WIDTH = 24.45;
-const ATT_PAYMENT_WIDTH = 135.78;
+// index ~4%, name ~28.5%, 10 session check boxes ~4.2% each, payment ~25%.
+const ATT_INDEX_WIDTH = 22;
+const ATT_NAME_WIDTH = 155;
+const ATT_SESSION_WIDTH = 23;
+const ATT_PAYMENT_WIDTH = 136;
 
 /** Number of blank ruled rows added at the bottom of the final attendance
  *  page for handwritten additions. */
@@ -183,8 +184,29 @@ const reportStyles = StyleSheet.create({
     flexDirection: "row",
     borderBottomWidth: 0.75,
     borderColor: BW_PALETTE.black,
+    // Strict row height keeps blank ruled rows from collapsing to zero.
+    height: 20,
+    minHeight: 20,
     // Print hygiene: never split a student row across a page bottom.
     breakInside: "avoid",
+  },
+
+  attIndexHeaderCell: {
+    width: ATT_INDEX_WIDTH,
+    paddingVertical: 5,
+    borderRightWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  attIndexCell: {
+    width: ATT_INDEX_WIDTH,
+    paddingVertical: 5,
+    borderRightWidth: 0.75,
+    borderColor: BW_PALETTE.black,
+    alignItems: "center",
+    justifyContent: "center",
   },
 
   attNameHeaderCell: {
@@ -239,6 +261,12 @@ const reportStyles = StyleSheet.create({
   attNameHeaderText: {
     fontSize: 8.5,
     fontWeight: 700,
+  },
+
+  attIndexText: {
+    fontSize: 8,
+    fontWeight: 700,
+    textAlign: "center",
   },
 
   attNameText: {
@@ -729,6 +757,7 @@ function buildPaymentStatusString(
 
 function AttendancePage({
   chunk,
+  chunkIndex,
   monthKey,
   sessions,
   payments,
@@ -737,6 +766,7 @@ function AttendancePage({
   isLastChunk,
 }: {
   chunk: AttendanceMatrixRow[];
+  chunkIndex: number;
   monthKey: string;
   sessions: Session[];
   payments: Payment[];
@@ -750,10 +780,14 @@ function AttendancePage({
   const blankRowCount = isLastChunk ? ATTENDANCE_BLANK_ROWS : 0;
 
   // The 10 session columns are intentionally empty check boxes — the sheet is
-  // printed and ticked by hand, one box per session.
-  const renderSessionCells = (): ReactNode[] =>
+  // printed and ticked by hand, one box per session. The blank-row variant
+  // renders a space-filled Text in every cell so the font's line-height keeps
+  // the row's strict 20pt height (an empty View collapses to zero).
+  const renderSessionCells = (blank = false): ReactNode[] =>
     Array.from({ length: ATTENDANCE_SESSION_COLUMNS }, (_, i) => (
-      <View key={`session-${i}`} style={reportStyles.attSessionCell} />
+      <View key={`session-${i}`} style={reportStyles.attSessionCell}>
+        {blank ? <Text> </Text> : null}
+      </View>
     ));
 
   return (
@@ -771,9 +805,12 @@ function AttendancePage({
         <Text style={reportStyles.attendanceTitle}>Feuille de présence</Text>
       </View>
 
-      {/* Table: Nom-prénom | 10 blank session check boxes | payement */}
+      {/* Table: N° | Nom-prénom | 10 blank session check boxes | payement */}
       <View style={reportStyles.attendanceTable}>
         <View style={reportStyles.attendanceHeaderRow} fixed>
+          <View style={reportStyles.attIndexHeaderCell}>
+            <Text style={reportStyles.attIndexText}>N°</Text>
+          </View>
           <View style={reportStyles.attNameHeaderCell}>
             <Text style={reportStyles.attNameHeaderText}>Nom-prénom</Text>
           </View>
@@ -785,9 +822,14 @@ function AttendancePage({
           </View>
         </View>
 
-        {/* Data rows */}
-        {chunk.map((row) => (
+        {/* Data rows — numbering continues across pages */}
+        {chunk.map((row, index) => (
           <View key={row.student.id} style={reportStyles.attendanceRow} wrap={false}>
+            <View style={reportStyles.attIndexCell}>
+              <Text style={reportStyles.attIndexText}>
+                {chunkIndex * ATTENDANCE_ROWS_PER_PAGE + index + 1}
+              </Text>
+            </View>
             <View style={reportStyles.attNameCell}>
               <Text style={reportStyles.attNameText}>
                 {row.student.lastName} {row.student.firstName}
@@ -805,18 +847,33 @@ function AttendancePage({
         {/* Blank rows for manual additions on the final page */}
         {Array.from({ length: blankRowCount }, (_, i) => (
           <View key={`blank-${i}`} style={reportStyles.attendanceRow} wrap={false}>
-            <View style={reportStyles.attNameCell} />
-            {renderSessionCells()}
-            <View style={reportStyles.attPaymentCell} />
+            <View style={reportStyles.attIndexCell}>
+              <Text> </Text>
+            </View>
+            <View style={reportStyles.attNameCell}>
+              <Text> </Text>
+            </View>
+            {renderSessionCells(true)}
+            <View style={reportStyles.attPaymentCell}>
+              <Text> </Text>
+            </View>
           </View>
         ))}
       </View>
 
       {/* Page counter — pinned to the bottom center of every page */}
       <Text
-        render={({ pageNumber, totalPages }) => `Page ${pageNumber} /${totalPages}`}
+        render={({ pageNumber, totalPages }) => `Page ${pageNumber} / ${totalPages}`}
         fixed
-        style={{ position: "absolute", bottom: 12, left: 0, right: 0, textAlign: "center", fontSize: 8 }}
+        style={{
+          position: "absolute",
+          bottom: 16,
+          left: 0,
+          right: 0,
+          textAlign: "center",
+          fontSize: 8,
+          color: "#555555",
+        }}
       />
     </Page>
   );
@@ -1072,6 +1129,7 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
         <AttendancePage
           key={`attendance-${idx}`}
           chunk={chunk}
+          chunkIndex={idx}
           monthKey={monthKey}
           sessions={options.sessions}
           payments={options.payments}
