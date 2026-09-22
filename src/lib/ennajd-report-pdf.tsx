@@ -6,6 +6,8 @@ import type { ReactNode } from "react";
 
 import { Document, Font, Image, Page, StyleSheet, Text, View, pdf } from "@react-pdf/renderer";
 
+import logoCentreEnnajd from "@/assets/logo-centre-ennajd.jpeg";
+
 import {
   buildAttendanceMatrix,
   type AttendanceMatrix,
@@ -347,6 +349,28 @@ const reportStyles = StyleSheet.create({
     right: 20,
     flexDirection: "row",
     justifyContent: "center",
+  },
+
+  // Center branding header (logo + name) of the attendance sheet
+  attendanceHeader: {
+    marginBottom: 10,
+  },
+
+  attendanceHeaderTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 6,
+  },
+
+  attendanceLogo: {
+    width: 40,
+    height: 40,
+    marginRight: 8,
+  },
+
+  attendanceBrand: {
+    fontSize: 13,
+    fontWeight: 700,
   },
 
   // Page number footer for payments report
@@ -789,8 +813,6 @@ function AttendancePage({
   track,
   groupType,
   appName,
-  pageNumber,
-  totalPages,
 }: {
   chunk: AttendanceMatrixRow[];
   dates: string[];
@@ -802,8 +824,6 @@ function AttendancePage({
   track: Track | null;
   groupType: GroupType | null;
   appName: string;
-  pageNumber: number;
-  totalPages: number;
 }) {
   const [year, month] = monthKey.split("-").map(Number);
   const monthName = new Date(year, month - 1, 1).toLocaleDateString("fr-FR", {
@@ -831,11 +851,18 @@ function AttendancePage({
 
   return (
     <Page size="A4" orientation="landscape" style={reportStyles.attendancePage}>
-      {/* Main title */}
-      <Text style={reportStyles.mainTitle}>FEUILLE DE PRÉSENCE MENSUELLE</Text>
+      {/* Header block — the `fixed` prop repeats it at the top of every page */}
+      <View fixed style={reportStyles.attendanceHeader}>
+        <View style={reportStyles.attendanceHeaderTop}>
+          <Image style={reportStyles.attendanceLogo} src={logoCentreEnnajd} />
+          <Text style={reportStyles.attendanceBrand}>CENTRE ENNAJD</Text>
+        </View>
 
-      {/* Info lines */}
-      <View style={reportStyles.infoContainer}>
+        {/* Main title */}
+        <Text style={reportStyles.mainTitle}>FEUILLE DE PRÉSENCE MENSUELLE</Text>
+
+        {/* Info lines */}
+        <View style={reportStyles.infoContainer}>
         <View style={reportStyles.leftInfo}>
           <Text style={[reportStyles.infoLine, reportStyles.infoLabel]}>
             MATIERE : {subject}
@@ -853,11 +880,12 @@ function AttendancePage({
           </Text>
         </View>
       </View>
+      </View>
 
       {/* Table */}
       <View style={reportStyles.table}>
-        {/* Header row */}
-        <View style={[reportStyles.tableHeaderRow]}>
+        {/* Header row — `fixed` repeats it at the top of the table on every page */}
+        <View style={[reportStyles.tableHeaderRow]} fixed>
           <View style={reportStyles.nameHeaderCell}>
             <Text style={reportStyles.nameHeaderText}>NOM ET PRENOM</Text>
           </View>
@@ -883,7 +911,7 @@ function AttendancePage({
           const isPaid = isStudentPaidForMonth(row.student.id);
 
           return (
-            <View key={row.student.id} style={reportStyles.tableRow}>
+            <View key={row.student.id} style={reportStyles.tableRow} wrap={false}>
               <View style={reportStyles.nameCell}>
                 <Text style={reportStyles.nameText}>
                   {row.student.lastName} {row.student.firstName}
@@ -920,11 +948,13 @@ function AttendancePage({
         })}
       </View>
 
-      {/* Page number footer */}
+      {/* Page number footer — repeats at the bottom of every page */}
       <View style={reportStyles.attendanceFooter}>
-        <Text style={reportStyles.pageNumberText}>
-          Page {pageNumber}/{totalPages}
-        </Text>
+        <Text
+          style={reportStyles.pageNumberText}
+          render={({ pageNumber, totalPages }) => `Page ${pageNumber} /${totalPages}`}
+          fixed
+        />
       </View>
     </Page>
   );
@@ -1189,8 +1219,6 @@ function EnnajdReportDocument({ options }: { options: RenderReportOptions }) {
           track={options.track}
           groupType={options.groupType}
           appName={options.appName}
-          pageNumber={idx + 1}
-          totalPages={pageChunks.length}
         />,
       );
     });
