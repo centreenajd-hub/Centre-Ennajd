@@ -19,7 +19,7 @@
 // Pure layer — zero React/Zustand, no hidden `new Date()` in the engine:
 // every `asOf` / `asOfKey` is passed in by the caller.
 
-import { getEnrolledStudentsForCombo, getSessionKind } from "@/lib/ennajd-taxonomy";
+import { getSessionKind } from "@/lib/ennajd-taxonomy";
 import type { EnrollmentCombo } from "@/lib/ennajd-taxonomy";
 import type {
   AttendanceRecord,
@@ -314,59 +314,6 @@ function countOccurrencesInRange(
     cursor.setDate(cursor.getDate() + 1);
   }
   return count;
-}
-
-// ---------------------------------------------------------------------------//
-// The group session anchor (Rule B — one shared due day-of-month per group)
-// ---------------------------------------------------------------------------//
-
-/**
- * The GROUP billing anchor for Rule B (2Bac Small groups): every member of a
- * combo shares ONE due day-of-month, derived from the group's own first
- * session rather than each student's enrollment date.
- *
- * Fallback chain: earliest dated `one_off` session of the combo → earliest
- * attendance date for any of the combo's sessions → earliest enrollment
- * date among the combo's members. `null` only when none of these resolve
- * (a brand-new group with no dated sessions/attendance yet) — the caller
- * then falls back to the student's own `enrolledAt`.
- */
-export function earliestGroupSessionDate(
-  combo: EnrollmentCombo,
-  sessions: Session[],
-  attendanceRecords: AttendanceRecord[],
-  students: Student[],
-): Date | null {
-  let earliest: Date | null = null;
-  const comboSessionIds = new Set<string>();
-
-  for (const session of sessions) {
-    if (!matchesCombo(session, combo)) continue;
-    comboSessionIds.add(session.id);
-    // 1. Earliest dated one_off session of the combo.
-    if (getSessionKind(session) === "one_off" && session.date) {
-      const parsed = parseDateKey(session.date);
-      if (parsed && (earliest === null || parsed < earliest)) earliest = parsed;
-    }
-  }
-  if (earliest !== null) return earliest;
-
-  // 2. Earliest attendance date for any of the combo's sessions.
-  for (const record of attendanceRecords) {
-    if (!record.date || !comboSessionIds.has(record.sessionId)) continue;
-    const parsed = parseDateKey(record.date);
-    if (parsed && (earliest === null || parsed < earliest)) earliest = parsed;
-  }
-  if (earliest !== null) return earliest;
-
-  // 3. Earliest enrollment date among the group's members.
-  for (const member of getEnrolledStudentsForCombo(students, combo)) {
-    const enrollment = member.enrollments.find((e) => e.subject === combo.subject);
-    const iso = enrollment?.enrolledAt ?? member.createdAt;
-    const parsed = typeof iso === "string" ? parseDateKey(iso.slice(0, 10)) : null;
-    if (parsed && (earliest === null || parsed < earliest)) earliest = parsed;
-  }
-  return earliest;
 }
 
 // ---------------------------------------------------------------------------//

@@ -1,65 +1,86 @@
 import { useState } from "react";
+import { CalendarIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Calendar } from "@/components/ui/calendar";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useI18n } from "@/lib/i18n";
 
 interface SmallGroupInlineEditProps {
-  initialDay: string;
-  initialMonth: string;
-  initialYear: string;
+  /** ISO date of the student's current first session for this subject. */
+  initialDateIso: string;
   initialPhone: string;
-  onSave: (p: { day: string; month: string; year: string; phone: string }) => void;
+  onSave: (p: { dateIso: string; phone: string }) => void;
   onCancel: () => void;
 }
 
+function parseDate(iso: string): Date | undefined {
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
+function formatDisplay(date: Date): string {
+  const dd = String(date.getDate()).padStart(2, "0");
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const yyyy = date.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
 export function SmallGroupInlineEdit({
-  initialDay,
-  initialMonth,
-  initialYear,
+  initialDateIso,
   initialPhone,
   onSave,
   onCancel,
 }: SmallGroupInlineEditProps) {
   const { t } = useI18n();
-  const [day, setDay] = useState(initialDay);
-  const [month, setMonth] = useState(initialMonth);
-  const [year, setYear] = useState(initialYear);
+  const [date, setDate] = useState<Date | undefined>(parseDate(initialDateIso));
   const [phone, setPhone] = useState(initialPhone);
+  const [open, setOpen] = useState(false);
 
   function handleSave() {
-    if (!day || !month || !year) return;
-    onSave({ day, month, year, phone });
+    if (!date) return;
+    // Local noon — the calendar day survives any timezone round-trip.
+    const iso = new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate(),
+      12, 0, 0, 0,
+    ).toISOString();
+    onSave({ dateIso: iso, phone });
   }
 
   return (
     <div className="space-y-3 rounded-xl border border-border bg-muted/30 p-3">
       <div className="space-y-1">
         <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          DATE DE LA PREMIÈRE SÉANCE
+          {t("firstSessionDate")}
         </p>
-        <div className="flex gap-2">
-          <Input
-            inputMode="numeric"
-            placeholder="DD"
-            value={day}
-            onChange={(e) => setDay(e.target.value.replace(/\D/g, "").slice(0, 2))}
-            className="h-9 w-16 rounded-lg text-center"
-          />
-          <Input
-            inputMode="numeric"
-            placeholder="MM"
-            value={month}
-            onChange={(e) => setMonth(e.target.value.replace(/\D/g, "").slice(0, 2))}
-            className="h-9 w-16 rounded-lg text-center"
-          />
-          <Input
-            inputMode="numeric"
-            placeholder="YYYY"
-            value={year}
-            onChange={(e) => setYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
-            className="h-9 w-24 rounded-lg text-center"
-          />
-        </div>
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-2 rounded-lg text-left font-normal"
+            >
+              <CalendarIcon className="h-4 w-4 shrink-0" />
+              {date ? formatDisplay(date) : t("pickDate")}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-0" align="start">
+            {/* Past dates are allowed: the first session may have already
+             * happened — the admin back-dates it and the cycle starts there. */}
+            <Calendar
+              mode="single"
+              selected={date}
+              onSelect={(selected) => {
+                if (selected) {
+                  setDate(selected);
+                  setOpen(false);
+                }
+              }}
+              initialFocus
+            />
+          </PopoverContent>
+        </Popover>
       </div>
       <div className="space-y-1">
         <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">

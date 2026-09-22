@@ -6,25 +6,11 @@ import { SmallGroupPeriodsTable } from "@/components/payments/SmallGroupPeriodsT
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useEnnajdState } from "@/hooks/use-ennajd-state";
-import {
-  earliestGroupSessionDate,
-  formatDateKey,
-  getDueBalanceForStudentSubject,
-} from "@/lib/ennajd-billing";
+import { formatDateKey, getDueBalanceForStudentSubject } from "@/lib/ennajd-billing";
 import { buildWhatsAppLink } from "@/lib/ennajd-whatsapp";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { Student, Subject } from "@/types/ennajd";
-
-function parseIsoDateParts(iso: string) {
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return { dd: "", mm: "", yyyy: "" };
-  return {
-    dd: String(d.getDate()).padStart(2, "0"),
-    mm: String(d.getMonth() + 1).padStart(2, "0"),
-    yyyy: String(d.getFullYear()),
-  };
-}
 
 function formatDisplayDateShort(isoDate: string): string {
   const d = new Date(isoDate);
@@ -33,15 +19,6 @@ function formatDisplayDateShort(isoDate: string): string {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const yyyy = d.getFullYear();
   return `${dd}/${mm}/${yyyy}`;
-}
-
-function isoFromDMY(dd: string, mm: string, yyyy: string): string | null {
-  const d = Number(dd), m = Number(mm), y = Number(yyyy);
-  if (!d || !m || !y) return null;
-  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
-  const dt = new Date(y, m - 1, d);
-  if (dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
-  return dt.toISOString();
 }
 
 interface SmallGroupStudentCardProps {
@@ -54,11 +31,8 @@ interface SmallGroupStudentCardProps {
 export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroupStudentCardProps) {
   const { t, lang } = useI18n();
   const payments = useEnnajdState((s) => s.payments);
-  const sessions = useEnnajdState((s) => s.sessions);
-  const attendanceRecords = useEnnajdState((s) => s.attendanceRecords);
-  const students = useEnnajdState((s) => s.students);
   const setPaymentPaid = useEnnajdState((s) => s.setPaymentPaid);
-  const updateStudent = useEnnajdState((s) => s.updateStudent);
+  const setSmallGroupFirstSessionDate = useEnnajdState((s) => s.setSmallGroupFirstSessionDate);
 
   const enrollment = useMemo(
     () => student.enrollments.find((e) => e.subject === subject) ?? null,
@@ -66,25 +40,6 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
   );
 
   const enrolledAtIso = enrollment?.enrolledAt ?? student.createdAt;
-  const enrolledAtParts = useMemo(() => parseIsoDateParts(enrolledAtIso), [enrolledAtIso]);
-
-  // Group anchor: every member of the group shares one due day-of-month,
-  // derived from the group's first session (enrollment-date fallback).
-  const groupAnchorIso = useMemo(() => {
-    if (!enrollment) return null;
-    const anchor = earliestGroupSessionDate(
-      {
-        level: student.level,
-        subject,
-        track: enrollment.track,
-        groupType: enrollment.groupType,
-      },
-      sessions,
-      attendanceRecords,
-      students,
-    );
-    return anchor ? anchor.toISOString() : null;
-  }, [enrollment, student.level, subject, sessions, attendanceRecords, students]);
 
   const balance = useMemo(
     () => getDueBalanceForStudentSubject(payments, student.id, subject, todayKey),
@@ -92,13 +47,11 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
   );
 
   // PROCHAINE ÉCHÉANCE: earliest due unpaid, else next upcoming, else the
-  // group's first-session date.
+  // student's own first-session date.
   const prochaineIso = balance.earliestDueDate ?? balance.nextUpcoming?.dueDate ?? null;
   const prochaineDisplay = useMemo(() => {
-    if (prochaineIso) return formatDisplayDateShort(prochaineIso);
-    if (!enrollment) return "—";
-    return formatDisplayDateShort(groupAnchorIso ?? enrolledAtIso);
-  }, [prochaineIso, groupAnchorIso, enrolledAtIso, enrollment]);
+    return formatDisplayDateShort(prochaineIso ?? enrolledAtIso);
+  }, [prochaineIso, enrolledAtIso]);
 
   const isOverdue = balance.isOverdue;
   const isPaidUp = !balance.hasInstallments ? false : balance.dueUnpaid.length === 0 && !isOverdue;
@@ -140,30 +93,25 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
     toast.success(t("installmentUnpaid"));
   }
 
-  function handleSaveEdit(p: { day: string; month: string; year: string; phone: string }) {
-    // Validate phone not empty
-    const iso = isoFromDMY(p.day, p.month, p.year);
-    if (!iso) {
-      toast.error(t("invalidAdjustAmount"));
-      return;
-    }
-    // Confirm date change if enrolledAt actually changes (day diff)
-    const newKey = formatDateKey(new Date(iso));
+  async function handleSaveEdit(p: { dateIso: string; phone: string }) {
+    // Confirm when the first-session day actually moves — the whole rolling
+    // schedule re-dates onto the new day-of-month.
+    const newKey = formatDateKey(new Date(p.dateIso));
     const oldKey = formatDateKey(new Date(enrolledAtIso));
     if (newKey !== oldKey) {
       const ok = window.confirm(t("confirmDateChange"));
       if (!ok) return;
     }
-    const nextEnrollments = student.enrollments.map((e) =>
-      e.subject === subject
-        ? { ...e, enrolledAt: iso }
-        : e
+    const ok = await setSmallGroupFirstSessionDate(
+      student.id,
+      subject,
+      p.dateIso,
+      p.phone,
     );
-    // whatsappPhone is on Student, not enrollment — update both in one patch.
-    // If phone differs, it updates for all cards; same call covers enrollments.
-    updateStudent(student.id, { whatsappPhone: p.phone.trim() || student.whatsappPhone, enrollments: nextEnrollments });
-    setEditing(false);
-    toast.success(t("saveEdit"));
+    if (ok) {
+      setEditing(false);
+      toast.success(t("saveEdit"));
+    }
   }
 
   const topBorderClass = isOverdue
@@ -212,9 +160,7 @@ export function SmallGroupStudentCard({ student, subject, todayKey }: SmallGroup
 
         {editing ? (
           <SmallGroupInlineEdit
-            initialDay={enrolledAtParts.dd}
-            initialMonth={enrolledAtParts.mm}
-            initialYear={enrolledAtParts.yyyy}
+            initialDateIso={enrolledAtIso}
             initialPhone={student.whatsappPhone}
             onSave={handleSaveEdit}
             onCancel={() => setEditing(false)}

@@ -5,7 +5,11 @@
 // Run with: npx vitest run src/hooks/use-ennajd-state.test.ts
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getPaymentRemaining, isPaymentFullyPaid } from "../lib/ennajd-billing";
+import {
+  formatDateKey,
+  getPaymentRemaining,
+  isPaymentFullyPaid,
+} from "../lib/ennajd-billing";
 import { useEnnajdState } from "./use-ennajd-state";
 import type {
   AttendanceRecord,
@@ -1299,5 +1303,212 @@ describe("syncPayments — wallet carryover to the next month", () => {
     expect(db.updatePaymentsBatchDoc).not.toHaveBeenCalled();
     expect(db.updateStudentAdvanceBalanceDoc).not.toHaveBeenCalled();
     expectOneRowPerMonth();
+  });
+});
+
+// ---------------------------------------------------------------------------//
+// setSmallGroupFirstSessionDate — the pencil on a 2Bac Small-group card. The
+// admin enters the student's FIRST SESSION date (any date, including a past
+// one); it becomes the Rule B billing anchor and the subject's unsettled
+// installments are re-scheduled from it — same day-of-month, monthly
+// (7/09 → 7/10 → 7/11 …).
+// ---------------------------------------------------------------------------//
+
+describe("setSmallGroupFirstSessionDate — the small-group pencil", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetStore();
+    vi.clearAllMocks();
+  });
+
+  /** Local noon of a calendar day — timezone-safe, mirrors the UI's submit. */
+  function localNoon(year: number, month: number, day: number): string {
+    return new Date(year, month, day, 12, 0, 0).toISOString();
+  }
+
+  it("re-schedules the whole rolling cycle onto the entered day-of-month", async () => {
+    // Started on the 15th; the admin back-dates the FIRST session to the 7th.
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09"),
+        ruleBPayment("b-oct", "2026-10"),
+        ruleBPayment("b-nov", "2026-11"),
+      ],
+      0,
+    );
+
+    const ok = await useEnnajdState
+      .getState()
+      .setSmallGroupFirstSessionDate(STUDENT_ID, "Math", localNoon(2026, 8, 7));
+
+    expect(ok).toBe(true);
+
+    // The generation horizon is now + 1 month (mid-December).
+    const ledger = ledgerByMonth();
+    expect([...ledger.keys()]).toEqual([
+      "2026-09",
+      "2026-10",
+      "2026-11",
+      "2026-12",
+    ]);
+    expect(ledger.get("2026-09")!.dueDate).toBe("2026-09-07");
+    expect(ledger.get("2026-10")!.dueDate).toBe("2026-10-07");
+    expect(ledger.get("2026-11")!.dueDate).toBe("2026-11-07");
+    expect(ledger.get("2026-12")!.dueDate).toBe("2026-12-07");
+    expect([...ledger.values()].every((p) => p.amountDue === 500)).toBe(true);
+
+    // The enrollment's first-session date moved onto the entered day.
+    const enrollment = useEnnajdState.getState().students.find(
+      (s) => s.id === STUDENT_ID,
+    )!.enrollments[0];
+    expect(formatDateKey(new Date(enrollment.enrolledAt!))).toBe("2026-09-07");
+
+    expectOneRowPerMonth();
+  });
+
+  it("keeps a settled month as the historical record and never re-mints it", async () => {
+    // September was already SETTLED by the parent (the ✓ action) on the 15th.
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09", 500, true),
+        ruleBPayment("b-oct", "2026-10"),
+      ],
+      0,
+    );
+
+    const ok = await useEnnajdState
+      .getState()
+      .setSmallGroupFirstSessionDate(STUDENT_ID, "Math", localNoon(2026, 8, 7));
+
+    expect(ok).toBe(true);
+
+    const ledger = ledgerByMonth();
+    // The settled September row is immutable — same id, same dueDate, still
+    // settled. No second invoice is ever minted for that month.
+    const sept = ledger.get("2026-09")!;
+    expect(sept.id).toBe("b-sept");
+    expect(sept.dueDate).toBe("2026-09-15");
+    expect(isPaymentFullyPaid(sept)).toBe(true);
+    // Only the later months are re-dated onto the 7th.
+    expect(ledger.get("2026-10")!.dueDate).toBe("2026-10-07");
+    expect(ledger.get("2026-11")!.dueDate).toBe("2026-11-07");
+    expect(ledger.get("2026-12")!.dueDate).toBe("2026-12-07");
+
+    const db = await import("@/lib/dbServices");
+    // The settled row ships in NO write — it is untouched.
+    const upserted = await upsertedRows();
+    expect(upserted.map((p) => p.id)).not.toContain("b-sept");
+    // The stale unsettled row is deleted BEFORE the re-dated rows ship, so
+    // unique(student_id, subject, due_date) stays satisfiable.
+    const deleted = await deletePaymentsBatchDocIds();
+    expect(deleted).toEqual(["b-oct"]);
+    expect(
+      vi.mocked(db.deletePaymentsBatchDoc).mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      vi.mocked(db.upsertPaymentsBatchDoc).mock.invocationCallOrder[0],
+    );
+    expectOneRowPerMonth();
+  });
+
+  it("redistributes the paid credit + wallet earliest-first over the rebuilt months", async () => {
+    // 300 MAD of credit sits on the unsettled October row; the cycle is
+    // re-anchored to the 7th and that credit must follow the STUDENT, not the
+    // row: it lands on the earliest rebuilt month (September).
+    seedWalletLedger(
+      [
+        ruleBPayment("b-oct", "2026-10", 300),
+        ruleBPayment("b-nov", "2026-11"),
+      ],
+      0,
+    );
+
+    const ok = await useEnnajdState
+      .getState()
+      .setSmallGroupFirstSessionDate(STUDENT_ID, "Math", localNoon(2026, 8, 7));
+
+    expect(ok).toBe(true);
+
+    const ledger = ledgerByMonth();
+    expect(getPaymentRemaining(ledger.get("2026-09")!)).toBe(200);
+    expect(getPaymentRemaining(ledger.get("2026-10")!)).toBe(500);
+    // Credit never settles a month — September owes nothing but stays RED
+    // until the user settles it.
+    expect(isPaymentFullyPaid(ledger.get("2026-09")!)).toBe(false);
+    expect(walletBalance()).toBe(0);
+    expectOneRowPerMonth();
+  });
+
+  it("parks unabsorbed surplus back in the wallet", async () => {
+    // 2600 in the wallet against four 500-MAD months: 2000 is absorbed, the
+    // remaining 600 returns to the wallet for the next cycle.
+    seedWalletLedger([ruleBPayment("b-nov", "2026-11")], 2600);
+
+    const ok = await useEnnajdState
+      .getState()
+      .setSmallGroupFirstSessionDate(STUDENT_ID, "Math", localNoon(2026, 8, 7));
+
+    expect(ok).toBe(true);
+
+    expect(getPaymentRemaining(ledgerByMonth().get("2026-12")!)).toBe(0);
+    expect(walletBalance()).toBe(600);
+    const db = await import("@/lib/dbServices");
+    expect(db.updateStudentAdvanceBalanceDoc).toHaveBeenCalledWith(STUDENT_ID, 600);
+    expectOneRowPerMonth();
+  });
+
+  it("is a no-op write when only the phone changed", async () => {
+    seedWalletLedger(
+      [
+        ruleBPayment("b-sept", "2026-09"),
+        ruleBPayment("b-oct", "2026-10"),
+        ruleBPayment("b-nov", "2026-11"),
+        ruleBPayment("b-dec", "2026-12"),
+      ],
+      0,
+    );
+
+    // Same first-session day (the 15th), new phone number. The identical
+    // instant as the seeded enrolledAt → no date change in any timezone.
+    const ok = await useEnnajdState.getState().setSmallGroupFirstSessionDate(
+      STUDENT_ID,
+      "Math",
+      "2026-09-15T12:00:00.000Z",
+      "0612345678",
+    );
+
+    expect(ok).toBe(true);
+    expect(useEnnajdState.getState().students.find((s) => s.id === STUDENT_ID)!
+      .whatsappPhone).toBe("0612345678");
+    // The date did not move → the Rule B ledger is never rewritten.
+    const db = await import("@/lib/dbServices");
+    expect(db.deletePaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.upsertPaymentsBatchDoc).not.toHaveBeenCalled();
+    expect(db.updateStudentAdvanceBalanceDoc).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the ledger when the payment write fails", async () => {
+    seedWalletLedger(
+      [ruleBPayment("b-sept", "2026-09"), ruleBPayment("b-oct", "2026-10")],
+      0,
+    );
+    const before = useEnnajdState.getState().payments;
+    mockState.failNextPaymentBatch = true;
+
+    const ok = await useEnnajdState
+      .getState()
+      .setSmallGroupFirstSessionDate(STUDENT_ID, "Math", localNoon(2026, 8, 7));
+
+    expect(ok).toBe(false);
+    // The ledger AND the first-session date both revert — the schedule that
+    // follows the anchor never landed, so leaving the date moved would
+    // desync store from DB and make a same-date retry a silent no-op.
+    expect(useEnnajdState.getState().payments).toBe(before);
+    expect(ledgerByMonth().get("2026-09")!.dueDate).toBe("2026-09-15");
+    const enrollment = useEnnajdState.getState().students.find(
+      (s) => s.id === STUDENT_ID,
+    )!.enrollments[0];
+    expect(formatDateKey(new Date(enrollment.enrolledAt!))).toBe("2026-09-15");
+    expect(toast.error).toHaveBeenCalled();
   });
 });

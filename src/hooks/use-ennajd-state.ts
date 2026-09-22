@@ -22,9 +22,9 @@ import {
   applyCreditWaterfall,
   buildDeliveredDatesContext,
   dedupePayments,
-  earliestGroupSessionDate,
   earliestValidAttendanceDate,
   formatDateKey,
+  generateRuleBSchedule,
   generateScheduleFor,
   getPaymentRuleFor,
   isMoreSettledPayment,
@@ -207,6 +207,20 @@ interface EnnajdState {
     student: Omit<Student, "id" | "createdAt">,
   ) => Promise<Student | null>;
   updateStudent: (id: string, patch: Partial<Omit<Student, "id">>) => Promise<boolean>;
+  /**
+   * SMALL-GROUP FIRST SESSION — the pencil on a 2Bac Small-group student
+   * card. The admin enters the student's FIRST SESSION date (any date,
+   * including a past one); it becomes the Rule B billing anchor and the
+   * subject's unsettled installments are re-scheduled from it (same
+   * day-of-month, monthly). Returns `false` when the write failed (already
+   * reverted + toasted).
+   */
+  setSmallGroupFirstSessionDate: (
+    studentId: string,
+    subject: Subject,
+    firstSessionIso: string,
+    phone?: string,
+  ) => Promise<boolean>;
   deleteStudent: (id: string) => Promise<boolean>;
 
   addSession: (session: Omit<Session, "id">) => Promise<Session | null>;
@@ -334,30 +348,21 @@ function generateInstallmentsForStudent(
       enrollment.track,
     );
     const enrolledAt = new Date(enrollment.enrolledAt ?? student.createdAt);
-    // Rule A bills from the student's earliest ATTENDANCE date (enrollment
-    // fallback) — the engine then anchors each month from that start. Rule B
-    // anchors on the GROUP's first session date (one shared due
-    // day-of-month for every member; enrollment-date fallback).
+    // Rule B anchors on the student's OWN first-session date — the one the
+    // admin enters with the pencil on their card: a full-price charge on
+    // that date, then the same day-of-month forever (7/09 → 7/10 → 7/11 …).
+    // Rule A anchors on the student's earliest PRESENT attendance
+    // (enrollment fallback).
     const anchor =
       rule === "B"
-        ? (earliestGroupSessionDate(
-            {
-              level: student.level,
-              subject: enrollment.subject,
-              track: enrollment.track,
-              groupType: enrollment.groupType,
-            },
-            state.sessions,
-            state.attendanceRecords,
-            state.students,
-          ) ?? enrolledAt)
-        : earliestValidAttendanceDate(
+        ? enrolledAt
+        : (earliestValidAttendanceDate(
             student.id,
             enrollment.subject,
             state.attendanceRecords,
             state.sessions,
             asOfKey,
-          ) ?? enrolledAt;
+          ) ?? enrolledAt);
     const fullPrice = state.getEffectivePrice(student.id, enrollment.subject);
     // customPrice wins outright; undefined only when neither customPrice nor
     // a base price exists — the combo is not billable.
@@ -662,6 +667,178 @@ export const useEnnajdState = create<EnnajdState>()((set, get) => ({
       );
     }
     return false;
+  },
+
+  /**
+   * SMALL-GROUP FIRST SESSION (the pencil on a 2Bac Small-group card).
+   *
+   * The admin enters the student's FIRST SESSION date — any date, including
+   * a past one. That date becomes the Rule B billing anchor: a full-price
+   * charge ON it, then the same day-of-month forever (7/09 → 7/10 → 7/11 …).
+   *
+   * The subject's UNSETTLED Rule B rows are re-scheduled from the new
+   * anchor. Their paid credit is pooled with the student's wallet and
+   * re-distributed earliest-first over the rebuilt rows (the waterfall);
+   * unabsorbed surplus parks back in `advanceBalance`. Rows carrying a
+   * recorded settlement are immutable — they stay as the historical record
+   * of what the parent already paid, and their months are skipped so a
+   * re-dated row never mints a second invoice for a paid month. Rule A rows
+   * are never touched.
+   */
+  setSmallGroupFirstSessionDate: async (studentId, subject, firstSessionIso, phone) => {
+    const state = get();
+    const student = state.students.find((s) => s.id === studentId);
+    if (!student) return false;
+    const enrollment = student.enrollments.find((e) => e.subject === subject);
+    if (!enrollment) return false;
+
+    const parsed = new Date(firstSessionIso);
+    if (isNaN(parsed.getTime())) return false;
+
+    const prevIso = enrollment.enrolledAt ?? student.createdAt;
+    const dateChanged = formatDateKey(new Date(prevIso)) !== formatDateKey(parsed);
+    const nextPhone = phone !== undefined ? phone.trim() : student.whatsappPhone;
+    const phoneChanged = nextPhone !== student.whatsappPhone;
+    if (!dateChanged && !phoneChanged) return true;
+
+    // Local noon — the calendar day survives any timezone round-trip
+    // (both the engine and the UI read local-calendar fields from this ISO).
+    const anchorIso = new Date(
+      parsed.getFullYear(),
+      parsed.getMonth(),
+      parsed.getDate(),
+      12, 0, 0, 0,
+    ).toISOString();
+
+    // 1. The student doc: the enrollment's first-session date (+ phone).
+    const prevStudents = state.students;
+    const updatedStudent: Student = {
+      ...student,
+      whatsappPhone: nextPhone,
+      enrollments: student.enrollments.map((e) =>
+        e.subject === subject ? { ...e, enrolledAt: anchorIso } : e,
+      ),
+    };
+    set({
+      students: prevStudents.map((s) => (s.id === studentId ? updatedStudent : s)),
+    });
+    const studentOk = await persist(
+      prevStudents,
+      (prev) => set({ students: prev }),
+      updateStudentDoc(studentId, updatedStudent),
+      "studentSaveFailed",
+    );
+    if (!studentOk || !dateChanged) return studentOk;
+
+    // 2. Re-schedule the Rule B ledger from the new first-session date.
+    const now = new Date();
+    const todayKey = formatDateKey(now);
+    // One month ahead — wallet surplus needs a landing row.
+    const generateThrough = new Date(now);
+    generateThrough.setMonth(generateThrough.getMonth() + 1);
+
+    const price = get().getEffectivePrice(studentId, subject);
+
+    const existing = get().payments.filter(
+      (p) => p.studentId === studentId && p.subject === subject && p.rule === "B",
+    );
+    const settledRows = existing.filter((p) => isSettlementRecorded(p));
+    const unsettledRows = existing.filter((p) => !isSettlementRecorded(p));
+
+    // A month carrying a recorded settlement is immutable — skip it so a
+    // re-dated row never mints a second invoice for a month the parent
+    // already paid.
+    const settledMonths = new Set(settledRows.map((p) => p.month));
+    const schedule =
+      price === undefined
+        ? []
+        : generateRuleBSchedule(new Date(anchorIso), generateThrough, price).filter(
+            (installment) => !settledMonths.has(installment.monthKey),
+          );
+
+    const rebuilt: Payment[] = schedule.map((installment) => ({
+      id: makeId(),
+      studentId,
+      subject,
+      dueDate: installment.dueDate,
+      month: installment.monthKey,
+      isPaid: false,
+      amountDue: installment.amount,
+      amountPaid: 0,
+      isHalfMonth: false,
+      rule: "B" as const,
+      updatedAt: now.toISOString(),
+    }));
+
+    // The re-scheduled rows' paid credit + the wallet, re-distributed
+    // earliest-first over the rebuilt months.
+    const creditPool =
+      unsettledRows.reduce((sum, p) => sum + (p.amountPaid ?? 0), 0) +
+      (updatedStudent.advanceBalance ?? 0);
+    const { updated, remaining } = applyCreditWaterfall(
+      rebuilt,
+      studentId,
+      subject,
+      creditPool,
+      todayKey,
+      now.toISOString(),
+    );
+    const patchById = new Map(updated.map((p) => [p.id, p]));
+    const finalRows = rebuilt.map((p) => patchById.get(p.id) ?? p);
+
+    const prevBalance = updatedStudent.advanceBalance ?? 0;
+    const nextBalance = Math.max(0, Math.round(remaining));
+    const walletChanged = nextBalance !== prevBalance;
+
+    if (unsettledRows.length === 0 && finalRows.length === 0 && !walletChanged) {
+      return true;
+    }
+
+    const previousPayments = get().payments;
+    const previousStudents = get().students;
+    const deleteIds = unsettledRows.map((p) => p.id);
+    const deleteSet = new Set(deleteIds);
+
+    set((s) => ({
+      payments: s.payments
+        .filter((p) => !deleteSet.has(p.id))
+        .concat(finalRows),
+      students: walletChanged
+        ? s.students.map((st) =>
+            st.id === studentId ? { ...st, advanceBalance: nextBalance } : st,
+          )
+        : s.students,
+    }));
+
+    try {
+      // DELETE BEFORE UPSERT: a re-dated row can land on a dueDate a stale
+      // row still occupies — deleting first keeps unique(student_id,
+      // subject, due_date) satisfiable.
+      if (deleteIds.length > 0) {
+        await deletePaymentsBatchDoc(deleteIds);
+      }
+      if (finalRows.length > 0) {
+        await upsertPaymentsBatchDoc(finalRows);
+      }
+      if (walletChanged) {
+        await updateStudentAdvanceBalanceDoc(studentId, nextBalance);
+      }
+    } catch (err) {
+      logPaymentWriteFailure("setSmallGroupFirstSessionDate", err);
+      // Revert the ledger AND the first-session date: the schedule that
+      // follows that date never landed, so leaving the anchor moved would
+      // desync store from DB AND make a same-date retry a silent no-op.
+      set({ payments: previousPayments, students: prevStudents });
+      void updateStudentDoc(
+        studentId,
+        prevStudents.find((s) => s.id === studentId)!,
+      ).catch(() => {
+        /* best-effort undo — a later realtime echo re-syncs the doc */
+      });
+      return false;
+    }
+
+    return true;
   },
 
   deleteStudent: async (id) => {
