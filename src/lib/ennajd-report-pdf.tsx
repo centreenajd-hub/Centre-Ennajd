@@ -270,8 +270,10 @@ const reportStyles = StyleSheet.create({
   },
 
   attNameText: {
+    fontFamily: "Helvetica",
     fontSize: 8.5,
     fontWeight: 600,
+    color: "#000000",
   },
 
   paymentMark: {
@@ -823,7 +825,10 @@ function AttendancePage({
         </View>
 
         {/* Data rows — numbering continues across pages */}
-        {chunk.map((row, index) => (
+        {chunk.map((row, index) => {
+          const studentName = `${row.student.lastName ?? ""} ${row.student.firstName ?? ""}`.trim();
+
+          return (
           <View key={row.student.id} style={reportStyles.attendanceRow} wrap={false}>
             <View style={reportStyles.attIndexCell}>
               <Text style={reportStyles.attIndexText}>
@@ -831,9 +836,7 @@ function AttendancePage({
               </Text>
             </View>
             <View style={reportStyles.attNameCell}>
-              <Text style={reportStyles.attNameText}>
-                {row.student.lastName} {row.student.firstName}
-              </Text>
+              <Text style={reportStyles.attNameText}>{studentName}</Text>
             </View>
             {renderSessionCells()}
             <View style={reportStyles.attPaymentCell}>
@@ -842,7 +845,8 @@ function AttendancePage({
               </Text>
             </View>
           </View>
-        ))}
+          );
+        })}
 
         {/* Blank rows for manual additions on the final page */}
         {Array.from({ length: blankRowCount }, (_, i) => (
